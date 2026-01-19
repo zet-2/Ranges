@@ -702,95 +702,94 @@ def display_results(snapshot: GameSnapshot, analysis: str, t_cap, t_vis, t_strat
     """Comprehensive display of GameSnapshot data."""
     console.clear()
     
-    # Header
-    console.print(f"\n[bold green]♠ POKER VISION SNAPSHOT ♠[/bold green]")
-    console.print(f"[dim]ID: {snapshot.hand_id} | Timestamp: {snapshot.timestamp}[/dim]")
-    console.print(f"⏱️  Capture: {t_cap:.2f}s | Vision: {t_vis:.2f}s | Strategy: {t_strat:.2f}s | Total: {t_tot:.2f}s\n")
+    # 1. EXTRACT RECOMMENDATION (At a glance!)
+    recommendation = "Analyzing..."
+    details = analysis
     
-    # ----- GAME STATE -----
-    street = snapshot.meta_info.current_street
-    board_str = " ".join(snapshot.board_state.community_cards) or "—"
-    pot = snapshot.board_state.total_pot
-    dealer_idx = snapshot.dealer_seat_index
-    
-    console.print(f"[bold cyan]═══ GAME STATE ═══[/bold cyan]")
-    console.print(f"  Street:       [bold blue]{street}[/bold blue]")
-    console.print(f"  Board:        [white]{board_str}[/white]")
-    console.print(f"  Total Pot:    [yellow]{pot} BB[/yellow]")
-    console.print(f"  Dealer Seat:  [magenta]Seat {dealer_idx + 1}[/magenta]")
-    console.print(f"  Action On:    [green]Seat {snapshot.action_on_seat_index + 1}[/green]")
-    console.print()
-    
-    # ----- HERO CONTEXT -----
-    ctx = snapshot.last_action_context
-    console.print(f"[bold cyan]═══ HERO CONTEXT ═══[/bold cyan]")
-    console.print(f"  Amount to Call: [yellow]{ctx.amount_to_call} BB[/yellow]")
-    
-    # Find aggressor info
-    if ctx.aggressor_seat_index >= 0:
-        aggressor = next((p for p in snapshot.players if p.seat_index == ctx.aggressor_seat_index), None)
-        if aggressor:
-            console.print(f"  Aggressor:      [red]{aggressor.name} (Seat {ctx.aggressor_seat_index + 1}) bet {aggressor.current_bet} BB[/red]")
-        else:
-            console.print(f"  Aggressor:      [red]Seat {ctx.aggressor_seat_index + 1}[/red]")
-    else:
-        console.print(f"  Aggressor:      [dim]None (checked around)[/dim]")
-    console.print()
-    
-    # ----- PLAYER TABLE -----
-    console.print(f"[bold cyan]═══ PLAYERS ═══[/bold cyan]")
-    
-    table = Table(show_header=True, header_style="bold white", box=None)
-    table.add_column("Seat", style="cyan", width=5)
-    table.add_column("Position", style="magenta", width=8)
-    table.add_column("Stack (BB)", justify="right", width=10)
-    table.add_column("Bet (BB)", justify="right", width=8)
-    table.add_column("Status", width=12)
-    table.add_column("Cards", width=10)
-    table.add_column("Role", width=10)
-    
-    for p in sorted(snapshot.players, key=lambda x: x.seat_index):
-        seat_num = p.seat_index + 1
-        pos = p.name or f"P{seat_num}"
-        stack = f"{p.stack_size:.1f}"
-        bet = f"{p.current_bet:.1f}" if p.current_bet > 0 else "—"
-        
-        # Status coloring
-        if p.status == "ACTIVE":
-            status = "[green]ACTIVE[/green]"
-        elif p.status == "FOLDED":
-            status = "[dim]FOLDED[/dim]"
-        elif p.status == "ALL_IN":
-            status = "[red]ALL-IN[/red]"
-        else:
-            status = f"[dim]{p.status}[/dim]"
-        
-        # Cards
-        cards = " ".join(p.hole_cards) if p.hole_cards else "—"
-        
-        # Role
-        roles = []
-        if p.is_hero:
-            roles.append("[yellow]HERO[/yellow]")
-        if p.is_dealer:
-            roles.append("[magenta]BTN[/magenta]")
-        role_str = " ".join(roles) if roles else "—"
-        
-        table.add_row(str(seat_num), pos, stack, bet, status, cards, role_str)
-    
-    console.print(table)
-    console.print()
-    
-    # ----- STRATEGY OUTPUT (if any) -----
     if analysis:
-        console.print(f"[bold cyan]═══ STRATEGY ADVICE ═══[/bold cyan]")
-        for line in analysis.split('\n'):
-            line = line.strip()
-            if line:
-                console.print(f"  {line}")
+        lines = analysis.split('\n')
+        if lines and "RECOMMENDATION" in lines[0].upper():
+            recommendation = lines[0]
+            details = "\n".join(lines[1:])
+        else:
+            # Fallback if model didn't follow strict format
+            recommendation = lines[0] if lines else "No advice."
+            details = "\n".join(lines[1:])
+
+    # Header
+    console.print(f"\n[dim]ID: {snapshot.hand_id} | {t_tot:.2f}s[/dim]")
+
+    # ★★★ BIG SUGGESTION BOX ★★★
+    if analysis:
+        style = "bold white on red"
+        if "FOLD" in recommendation.upper(): style = "bold white on red"
+        elif "CHECK" in recommendation.upper(): style = "bold black on yellow"
+        elif "CALL" in recommendation.upper(): style = "bold black on yellow"
+        elif "RAISE" in recommendation.upper(): style = "bold white on green"
+        elif "BET" in recommendation.upper(): style = "bold white on green"
+        
+        console.print()
+        console.print(f" {recommendation} ", style=style, justify="center")
+        console.print()
+
+    # ----- COMPACT HUD -----
+    grid = Table.grid(expand=True, padding=(0, 2))
+    grid.add_column(justify="center", ratio=1)
+    grid.add_column(justify="center", ratio=1)
+    grid.add_column(justify="center", ratio=1)
+    
+    # Hero Hand
+    hero = next((p for p in snapshot.players if p.is_hero), None)
+    hero_cards = " ".join(hero.hole_cards) if hero and hero.hole_cards else "—"
+    
+    # Board
+    board_str = " ".join(snapshot.board_state.community_cards) or "Preflop"
+    
+    # Pot
+    pot = f"{snapshot.board_state.total_pot} BB"
+    
+    grid.add_row(
+        f"[bold cyan]HERO[/bold cyan]\n[bold white]{hero_cards}[/bold white]",
+        f"[bold cyan]BOARD ({snapshot.meta_info.current_street})[/bold cyan]\n[bold white]{board_str}[/bold white]",
+        f"[bold cyan]POT[/bold cyan]\n[bold yellow]{pot}[/bold yellow]"
+    )
+    console.print(grid)
+    console.print()
+
+    # ----- STRATEGY DETAILS -----
+    if details:
+        console.print(f"[dim]Analysis:[/dim]")
+        console.print(details.strip())
         console.print()
     
-    console.print(f"[bold cyan]════════════════════════════════════════[/bold cyan]")
+    # ----- COMPACT PLAYER TABLE (Background info) -----
+    # Only show if requested or in debug, or make it very small
+    # console.print(f"[dim]Active Players:[/dim]")
+    table = Table(show_header=True, header_style="dim", box=None, padding=(0,1))
+    table.add_column("Seat", style="dim", width=4)
+    table.add_column("Pos", style="magenta", width=6)
+    table.add_column("Stack", justify="right", width=8)
+    table.add_column("Act", width=12) # Action/Status
+    
+    for p in sorted(snapshot.players, key=lambda x: x.seat_index):
+        if p.status == "SITTING_OUT": continue
+        
+        seat_num = str(p.seat_index + 1)
+        pos = p.name or "?"
+        stack = f"{p.stack_size:.0f}"
+        
+        # Status/Action
+        if p.is_hero: act = "[bold yellow]HERO[/bold yellow]"
+        elif p.status == "FOLDED": act = "[dim]Fold[/dim]"
+        elif p.current_bet > 0: act = f"[red]Bet {p.current_bet}[/red]"
+        else: act = "[green]Check/Wait[/green]"
+        
+        if p.is_dealer: pos += " (D)"
+        
+        table.add_row(seat_num, pos, stack, act)
+    
+    console.print(table)
+    console.print(f"[dim]════════════════════════════════[/dim]")
 
 
 
@@ -860,13 +859,11 @@ def run_analysis_flow(mode: str = "debug"):
                 - Pot: {snapshot.board_state.total_pot} BB
                 - Amount to Call: {snapshot.last_action_context.amount_to_call} BB
                 
-                Provide:
-                1. What happened so far (summarize the action)
-                2. Opponent range analysis
-                3. Hero's equity estimate
-                4. RECOMMENDED ACTION with sizing
+                OUTPUT FORMAT (STRICT):
+                Line 1: RECOMMENDATION: [ACTION] [SIZING] (e.g., "RECOMMENDATION: RAISE to 2.5BB" or "RECOMMENDATION: FOLD")
+                Line 2+: Concise reasoning (bullet points).
                 
-                Be concise but thorough.
+                Be extremely concise.
                 """
                 
                 try:
@@ -882,7 +879,7 @@ def run_analysis_flow(mode: str = "debug"):
         display_results(snapshot, analysis, t_capture, t_vision, t_strategy, t_total)
         
         # Show history summary
-        console.print(f"\n[dim]{current_history.summary()}[/dim]")
+        # console.print(f"\n[dim]{current_history.summary()}[/dim]")
         
     except Exception as e:
         console.print(f"[red]Error: {e}[/red]")
