@@ -179,43 +179,58 @@ class HandHistory:
         return "\n".join(lines)
 
 
-ANALYZE_PROMPT = """Analyze these 8 images to construct a precise poker game state.
-Images 1-6: Seats 1 through 6.
-Image 7: Board (Community Cards + Pot Info).
-Image 8: Action Buttons (Fold/Call/Raise) - Critical for determining Hero's turn.
+ANALYZE_PROMPT = """
+Role: You are a Poker Vision Expert. Analyze the provided poker table images to generate a precise game state JSON.
 
-CRITICAL VISUAL CUES:
-- ACTIVE player: Has cards with RED back visible
-- FOLDED player: No cards visible (cards were folded away)
-- SITTING OUT: No balance shown under name, OR text says "Sitting out"
-- Dealer: Look for a "white D button" next to the player
+INPUT CONTEXT:
+- You are analyzing individual seat crops (Images 1-6), the Board (Image 7), and Actions (Image 8).
+- The visual style is PokerStars "Carbon" or similar dark theme.
 
-IMPORTANT: The stack is ALWAYS shown as "X.X BB" text below the username.
+VISUAL ANALYSIS INSTRUCTIONS (STRICT HIERARCHY):
 
-Check Image 8 to see if action buttons are visible (meaning it's Hero's turn).
+1. STEP ONE: DETERMINE PLAYER STATUS (Check in this exact order):
+   - **ACTIVE:** - Visible **CARDS** above the nameplate.
+     - Look for two **RED/PATTERNED CARD BACKS** (Opponent) OR two **FACE-UP CARDS** (Hero).
+   - **FOLDED (In Game, No Cards):** - Player has a Name and a **VISIBLE STACK VALUE** (e.g., "18 BB") inside the pod.
+     - BUT there are **NO CARDS** above the nameplate.
+   - **SITTING OUT:** - Player has a Name, but there is **NO STACK VALUE** displayed under the name.
+     - OR explicit text says "Sitting Out".
+   - **EMPTY:** - No Name, no chips, black background.
 
-JSON OUTPUT FORMAT:
+2. STEP TWO: EXTRACT ATTRIBUTES (Independent of Status):
+   - **STACK SIZE:** Extract the number inside the player pod if visible. If status is 'Sitting Out', this is likely null/0.
+   - **CURRENT BET:** A *separate* graphical element (pill/oval/chip icon) located *outside* or *next to* the player pod.
+     - *Crucial:* Check for this bubble for ALL players (Active, Folded, or Sitting Out).
+     - *Scenario:* A folded player might still have a bet bubble (dead money) from earlier action.
+   - **DEALER BUTTON:** Look for a small white circular disk with a black "D". It can be next to any player type.
+
+3. HERO IDENTIFICATION (Seat 5):
+   - If Seat 5 is Hero, extract rank/suit of face-up cards.
+   - Format: ["Ah", "Tc"] (Rank + Suit).
+
+OUTPUT FORMAT (JSON ONLY):
 {
   "seats": [
-    { 
-      "seat_index": 0, # (Seat 1 = Index 0, Seat 6 = Index 5)
-      "stack_size_bb": number, 
-      "current_bet_bb": number, # Look for small numeric text near cards/avatar representing chips in the pot (NOT the stack).
-      "has_cards": boolean, # TRUE if cards are visible (Face-UP for Hero, or Red backs for others)
-      "is_folded": boolean, # TRUE if player had cards but folded (no cards visible now)
-      "is_sitting_out": boolean, # TRUE if no balance shown or "Sitting out" text
-      "is_dealer": boolean,
-      "hole_cards": ["card1", "card2"] or null # CRITICAL: DOUBLE CHECK Seat 5 (Index 4) for cards!
-    },
-    ... (repeat for all 6 seats)
+    {
+      "seat_index": <0-5, corresponding to image order>,
+      "name": <String or null>,
+      "stack_size_bb": <Float or 0 if sitting out>,
+      "current_bet_bb": <Float (Check for bet bubble even if folded!)>,
+      "has_cards": <Boolean - True ONLY if cards visible>,
+      "is_folded": <Boolean - True if Stack visible but NO cards>,
+      "is_sitting_out": <Boolean - True if Name present but NO Stack>,
+      "is_dealer": <Boolean - Check for 'D' button regardless of status>,
+      "hole_cards": <["Rs", "Rs"] or null>
+    }
   ],
-  "board_cards": ["card", "card"...],
-  "total_pot_bb": number,
+  "board_cards": [<list of community cards>],
+  "total_pot_bb": <Float from pot info>,
   "hero_context": {
-    "is_turn": true,
-    "amount_to_call_bb": biggest current bet
+    "is_turn": <Boolean>,
+    "action_options": ["Check", "Call", "Raise"]
   }
-}"""
+}
+"""
 
 # boolean, # True if buttons are visible in Image 8
 # (Prompt for Strategy remains similar but consumes this JSON)
