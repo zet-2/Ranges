@@ -850,6 +850,45 @@ def run_analysis_flow(mode: str = "debug"):
             else:
                 t2 = time.time()
                 
+                # --- INTELLIGENT POT TRACKING ---
+                # Fixes vision glitches where pot size momentarily drops (e.g. 8.0 -> 3.5)
+                current_street = snapshot.meta_info.current_street
+                max_seen_pot = 0.0
+                
+                # Scan history for the highest pot value recorded on THIS street
+                for s in current_history.snapshots:
+                    if s.meta_info.current_street == current_street:
+                         if s.board_state.total_pot > max_seen_pot:
+                             max_seen_pot = s.board_state.total_pot
+                
+                # If current snapshot has a valid pot, compare it too
+                if snapshot.board_state.total_pot > max_seen_pot:
+                    max_seen_pot = snapshot.board_state.total_pot
+                
+                # Calculate Effective Pot (Center + Active Bets)
+                # Vision 'Pot' text area is usually separate from player 'Bet' bubbles.
+                current_bets = sum(p.current_bet for p in snapshot.players)
+                final_pot = max_seen_pot + current_bets
+                
+                # --- PYTHON MATH LAYER (Derived Metrics) ---
+                # 1. Effective Stack (Hero vs Deepest Active Villain)
+                active_villains = [p for p in snapshot.players if not p.is_hero and p.status in ["ACTIVE", "ALL_IN"]]
+                max_villain_stack = max((p.stack_size for p in active_villains), default=0.0)
+                eff_stack = min(hero.stack_size, max_villain_stack) if active_villains else hero.stack_size
+                
+                # 2. SPR (Stack-to-Pot Ratio)
+                spr = (eff_stack / final_pot) if final_pot > 0 else 0.0
+                
+                # 3. Pot Odds
+                call_amount = snapshot.last_action_context.amount_to_call
+                if call_amount > 0:
+                    # Risk / (Reward + Risk)
+                    pot_odds_pct = (call_amount / (final_pot + call_amount)) * 100
+                    pot_odds_ratio = f"{(final_pot / call_amount):.1f}:1"
+                else:
+                    pot_odds_pct = 0.0
+                    pot_odds_ratio = "N/A"
+
                 # Build strategy prompt with FULL HISTORY
                 history_json = current_history.to_json()
                 strategy_prompt = f"""
@@ -860,9 +899,15 @@ def run_analysis_flow(mode: str = "debug"):
                 
                 CURRENT SITUATION:
                 - Board: {" ".join(snapshot.board_state.community_cards)}
-                - Hero: {" ".join(hero.hole_cards)}
-                - Pot: {snapshot.board_state.total_pot} BB
-                - Call: {snapshot.last_action_context.amount_to_call} BB
+                - Hero: {" ".join(hero.hole_cards)} ({hero.name})
+                - Position: {hero.name}
+                - Pot: {final_pot:.2f} BB
+                - Call: {call_amount} BB
+                
+                MATH & METRICS (Calculated):
+                - Effective Stack: {eff_stack:.1f} BB
+                - SPR: {spr:.2f}
+                - Pot Odds: {pot_odds_pct:.1f}% ({pot_odds_ratio})
                 
                 OUTPUT FORMAT (STRICT):
                 Line 1: RECOMMENDATION: [ACTION] [SIZING] (e.g. "RECOMMENDATION: FOLD")
