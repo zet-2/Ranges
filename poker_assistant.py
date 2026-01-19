@@ -1055,6 +1055,38 @@ def calculate_villain_stats(villain_name: str, past_hands_list: list) -> str:
     return f"VPIP: {vpip:.0f}% | PFR: {pfr:.0f}% | AF: {af:.1f} (Sample: {total_hands} hands)"
 
 
+def is_valid_username(name: str) -> bool:
+    """Filters out invalid OCR detections (actions, positions, numbers)."""
+    if not name or len(name) < 2: return False
+    
+    # Common OCR misreads
+    BAD_KEYWORDS = {
+        "CALL", "BET", "CHECK", "RAISE", "FOLD", "ALL-IN", "ALLIN",
+        "BB", "SB", "UTG", "MP", "CO", "BTN", "DEALER",
+        "UNKNOWN", "SEAT", "POT", "TOTAL"
+    }
+    
+    clean_name = name.upper().strip()
+    
+    # 1. Exact Keyword Match
+    if clean_name in BAD_KEYWORDS: return False
+    
+    # 2. "Call (BB)" pattern (Action + Position)
+    if "(" in clean_name or ")" in clean_name: return False
+    
+    # 3. Numeric (Stack read as name)
+    try:
+        float(name.replace("$","").replace("€","").replace(",","."))
+        return False # It's a number
+    except:
+        pass
+        
+    # 4. Unknown_S prefix
+    if clean_name.startswith("UNKNOWN_S"): return False
+    
+    return True
+
+
 def save_villain_db(history_hands: list):
     """Aggregates and saves all villain stats to villain_stats.json for user inspection."""
     db = {}
@@ -1068,15 +1100,12 @@ def save_villain_db(history_hands: list):
                 # Prefer username, fallback to name if not hero
                 if not p.get("is_hero"):
                     name = p.get("username") or p.get("name")
-                    if name and name != "Unknown":
+                    if name and is_valid_username(name):
                         all_players.add(name)
 
     # 2. Calculate stats for each
     for name in all_players:
         stats_str = calculate_villain_stats(name, history_hands)
-        # Parse the string back to dict for cleaner JSON? Or just save string.
-        # User asked to "check it", readable string is fine, but object is better.
-        # For now, let's save the readable string as requested.
         db[name] = stats_str
             
     # 3. Save
@@ -1203,36 +1232,32 @@ def generate_strategy_prompt(history_json: str, action_history: str, villain_sta
     odds_str = metrics.get("pot_odds_str", "N/A")
 
     return f"""
-You are a professional poker strategist. 
+ROLE: Poker Strategist. GOAL: Max EV.
 
-Context:
-- Board: {board}
-- Hero Hand: {hero_cards}
-- Hand Rank: {hand_rank}
-- Position: {hero_pos}
+[STATE]
+Board: {board}
+Hero: {hero_cards} ({hero_pos})
+Rank: {hand_rank}
+Pot: {final_pot:.2f} BB
+Action: {current_action}
 
-Villain Stats:
+[METRICS]
+Eff Stack: {eff_stack:.1f} BB
+SPR: {spr:.2f}
+Odds: {odds_str}
+
+[VILLAINS]
 {villain_stats}
 
-Action History:
+[HISTORY]
 {action_history}
 
-Math:
-- Effective Stack: {eff_stack:.1f} BB
-- SPR: {spr:.2f}
-- Pot Odds: {odds_str}
+[DATA]
+{history_json}
 
-Current Situation:
-- Pot: {final_pot:.2f} BB
-- Pending Action: {current_action}
-
-Output Constraints:
-- DO NOT summarize the hand history.
-- DO NOT estimate specific equity percentages.
-- BE INSTANT.
-- Strictly follow the output format:
-Line 1: RECOMMENDATION: [ACTION] [SIZING]
-Line 2+: Max 3 bullet points of reasoning.
+[INSTRUCTIONS]
+1. RECOMMENDATION: [ACTION] [SIZING]
+2. REASONING: Max 3 bullets. No summary. Be instant.
 """
 
 
@@ -1353,6 +1378,11 @@ def run_analysis_flow(mode: str = "debug"):
                     if p.status in ["ACTIVE", "ALL_IN"]:
                         # Track by Username (e.g. "Player123"), show Position (e.g. "BTN")
                         lookup_name = p.username if p.username else p.name
+                        
+                        # Sanity Check
+                        if not is_valid_username(lookup_name):
+                            continue
+                            
                         stats = calculate_villain_stats(lookup_name, history_hands)
                         villain_profiles.append(f"- {lookup_name} ({p.name}): {stats}")
                 
