@@ -33,7 +33,7 @@ genai.configure(api_key=GEMINI_API_KEY)
 # Initialize Dual Models
 # Switching to 2.0 Flash for Vision as well for speed (3.0 Preview is high latency)
 vision_model = genai.GenerativeModel("gemini-2.0-flash-exp")    
-strategy_model = genai.GenerativeModel("gemini-2.0-flash")
+strategy_model = genai.GenerativeModel("gemini-3-flash-preview")
 
 # Data file path
 DATA_FILE = os.path.join(os.path.dirname(__file__), "poker_data.json")
@@ -74,7 +74,8 @@ class BoardState:
 @dataclass
 class Player:
     seat_index: int
-    name: str = ""
+    name: str = "" # Position Label (e.g. "BTN")
+    username: str = "" # Actual Player Name (e.g. "Player123")
     stack_size: float = 0.0
     hole_cards: list = None # ["Ah", "Kd"] or None
     current_bet: float = 0.0 # Chips currently in front
@@ -166,7 +167,28 @@ class HandHistory:
             "turns": [dataclasses.asdict(s) for s in self.snapshots]
         }
         return json.dumps(history, indent=2)
-    
+
+    def to_min_json(self) -> str:
+        """Minimized JSON for strategy prompt."""
+        turns = []
+        for s in self.snapshots:
+            min_players = []
+            for p in s.players:
+                min_players.append({
+                    "pos": p.name,
+                    "stack": f"{p.stack_size:.1f}",
+                    "bet": p.current_bet,
+                    "status": p.status
+                })
+            turns.append({
+                "street": s.meta_info.current_street,
+                "board": s.board_state.community_cards,
+                "pot": s.board_state.total_pot,
+                "actor": s.action_on_seat_index,
+                "players": min_players
+            })
+        return json.dumps({"hand_id": self.hand_id, "turns": turns}, indent=2)
+
     def summary(self) -> str:
         """Quick text summary of the hand so far."""
         if not self.snapshots:
@@ -183,7 +205,10 @@ ANALYZE_PROMPT = """
 Role: You are a Poker Vision Expert. Analyze the provided poker table images to generate a precise game state JSON.
 
 INPUT CONTEXT:
-- You are analyzing individual seat crops (Images 1-6), the Board (Image 7), and Actions (Image 8).
+- **Images 1, 2, 3, 4, 6:** Villain Seats (Extract Villain Name & Stack).
+- **Image 5:** Hero Seat (Extract Hero Name & Stack).
+- **Image 7:** Board.
+- **Image 8:** Actions.
 - The visual style is PokerStars "Carbon" (4-Color Deck).
 - **COLOR KEY:** Gray/Black = Spades (s), Blue = Diamonds (d), Red = Hearts (h), Green = Clubs (c).
 
@@ -199,8 +224,12 @@ VISUAL ANALYSIS INSTRUCTIONS (STRICT HIERARCHY):
    - **EMPTY:** - No Name, no chips, black background.
 
 2. STEP TWO: EXTRACT ATTRIBUTES (Independent of Status):
+   - **USERNAME:** 
+     - Extract the player's username from the individual seat crop (Images 1-6).
+     - **LOCATION:** The name is ALWAYS located immediately ABOVE the stack value inside the player pod.
+     - Extract the exact string. If no name, use null.
    - **STACK SIZE (CRITICAL - CONVERT TO BB):** 
-     - Extract the number inside the player pod.
+     - Extract the number inside the player pod (located BELOW the username).
      - **IF CURRENCY DETECTED (e.g. "$2.00", "€5.00"):** Convert to BBs assuming Big Blind = 0.02 (e.g. 2.00 -> 100 BB).
      - **IF NUMBER ONLY:** Assume it is already in BBs.
    - **CURRENT BET (CONVERT TO BB):** 
@@ -429,6 +458,9 @@ def parse_response(text: str) -> GameSnapshot:
                 idx = 0
 
             player = Player(seat_index=idx)
+            
+            # Store OCR Username
+            player.username = p_data.get("name") or f"Unknown_S{idx}"
             
             # Handle stack variations
             stack_val = p_data.get("stack_size_bb") or p_data.get("stack") or 0
@@ -716,7 +748,7 @@ def analyze_and_display(monitor: int):
             console.print(f"[red]Error: {e}[/red]")
 
 
-def display_results(snapshot: GameSnapshot, analysis: str, t_cap, t_vis, t_strat, t_tot, metrics: dict = None):
+def display_results(snapshot: GameSnapshot, analysis: str, t_cap, t_vis, t_strat, t_tot, metrics: dict = None, hand_rank: str = ""):
     """Comprehensive display of GameSnapshot data."""
     console.clear()
     
@@ -759,6 +791,7 @@ def display_results(snapshot: GameSnapshot, analysis: str, t_cap, t_vis, t_strat
     # Hero Hand
     hero = next((p for p in snapshot.players if p.is_hero), None)
     hero_cards = " ".join(hero.hole_cards) if hero and hero.hole_cards else "—"
+    hand_display = f"{hero_cards}\n[bold yellow]({hand_rank})[/bold yellow]" if hand_rank else hero_cards
     
     # Board
     board_str = " ".join(snapshot.board_state.community_cards) or "Preflop"
@@ -767,7 +800,7 @@ def display_results(snapshot: GameSnapshot, analysis: str, t_cap, t_vis, t_strat
     pot = f"{snapshot.board_state.total_pot} BB"
     
     grid.add_row(
-        f"[bold cyan]HERO[/bold cyan]\n[bold white]{hero_cards}[/bold white]",
+        f"[bold cyan]HERO[/bold cyan]\n[bold white]{hand_display}[/bold white]",
         f"[bold cyan]BOARD ({snapshot.meta_info.current_street})[/bold cyan]\n[bold white]{board_str}[/bold white]",
         f"[bold cyan]POT[/bold cyan]\n[bold yellow]{pot}[/bold yellow]"
     )
@@ -976,7 +1009,8 @@ def calculate_villain_stats(villain_name: str, past_hands_list: list) -> str:
         
         for i, curr in enumerate(snapshots):
             players = curr.get("players", [])
-            p_curr = next((p for p in players if p.get("name") == villain_name), None)
+            # Match by Username (preferred) or Name (fallback for old logs)
+            p_curr = next((p for p in players if p.get("username", p.get("name")) == villain_name), None)
             if not p_curr: continue
             
             player_seen = True
@@ -984,7 +1018,7 @@ def calculate_villain_stats(villain_name: str, past_hands_list: list) -> str:
             
             if i > 0:
                 prev = snapshots[i-1]
-                p_prev = next((p for p in prev.get("players", []) if p.get("name") == villain_name), None)
+                p_prev = next((p for p in prev.get("players", []) if p.get("username", p.get("name")) == villain_name), None)
                 if p_prev:
                     curr_bet = p_curr.get("current_bet", 0)
                     prev_bet = p_prev.get("current_bet", 0)
@@ -1011,12 +1045,195 @@ def calculate_villain_stats(villain_name: str, past_hands_list: list) -> str:
             if vpiped: vpip_hands += 1
             if pfrd: pfr_hands += 1
             
-    if total_hands == 0: return "Unknown (0 hands)"
+    if total_hands < 5: 
+        return f"Unknown (Sample {total_hands} < 5)"
+        
     vpip = (vpip_hands / total_hands) * 100
     pfr = (pfr_hands / total_hands) * 100
     af = agg_actions / max(pass_actions, 1)
     
     return f"VPIP: {vpip:.0f}% | PFR: {pfr:.0f}% | AF: {af:.1f} (Sample: {total_hands} hands)"
+
+
+def save_villain_db(history_hands: list):
+    """Aggregates and saves all villain stats to villain_stats.json for user inspection."""
+    db = {}
+    
+    # 1. Identify all unique players
+    all_players = set()
+    for hand in history_hands:
+        # Check first turn for player list (usually static per hand)
+        if hand:
+            for p in hand[0].get("players", []):
+                # Prefer username, fallback to name if not hero
+                if not p.get("is_hero"):
+                    name = p.get("username") or p.get("name")
+                    if name and name != "Unknown":
+                        all_players.add(name)
+
+    # 2. Calculate stats for each
+    for name in all_players:
+        stats_str = calculate_villain_stats(name, history_hands)
+        # Parse the string back to dict for cleaner JSON? Or just save string.
+        # User asked to "check it", readable string is fine, but object is better.
+        # For now, let's save the readable string as requested.
+        db[name] = stats_str
+            
+    # 3. Save
+    try:
+        with open("villain_stats.json", "w") as f:
+            json.dump(db, f, indent=2, sort_keys=True)
+    except Exception as e:
+        console.print(f"[dim]Error saving villain DB: {e}[/dim]")
+
+
+class HandEvaluator:
+    """Pure Python Poker Hand Evaluator."""
+    
+    RANKS = '23456789TJQKA'
+    
+    @staticmethod
+    def parse_card(card_str):
+        if not card_str: return None, None
+        card_str = card_str.strip().upper()
+        
+        # Handle '10' as 'T'
+        if card_str.startswith("10"):
+            r = "T"
+            s = card_str[2:].lower() if len(card_str) > 2 else ""
+        else:
+            r = card_str[0]
+            s = card_str[1:].lower() if len(card_str) > 1 else ""
+            
+        if r not in HandEvaluator.RANKS: return None, None
+        return HandEvaluator.RANKS.index(r) + 2, s
+
+    @staticmethod
+    def evaluate(hero_cards, board_cards):
+        if not hero_cards: return "Unknown"
+        
+        all_cards = hero_cards + board_cards
+        if not all_cards: return "No Cards"
+        
+        parsed = [HandEvaluator.parse_card(c) for c in all_cards]
+        parsed = [p for p in parsed if p[0] is not None]
+        
+        if len(parsed) < 2: return "High Card"
+
+        ranks = sorted([p[0] for p in parsed], reverse=True)
+        suits = [p[1] for p in parsed]
+        
+        # Check Flush
+        flush_suit = None
+        for s in 'shdc':
+            if suits.count(s) >= 5:
+                flush_suit = s
+                break
+        
+        # Check Straight
+        unique_ranks = sorted(list(set(ranks)), reverse=True)
+        straight_high = None
+        
+        # Ace low straight check (5, 4, 3, 2, A)
+        if {14, 2, 3, 4, 5}.issubset(set(unique_ranks)):
+            straight_high = 5 # 5-high straight
+            
+        for i in range(len(unique_ranks) - 4):
+            window = unique_ranks[i:i+5]
+            if window[0] - window[4] == 4:
+                straight_high = window[0]
+                break
+                
+        # Straight Flush
+        if flush_suit and straight_high:
+            # Need to verify if the straight cards are of the flush suit
+            flush_cards = [p[0] for p in parsed if p[1] == flush_suit]
+            flush_ranks = sorted(list(set(flush_cards)), reverse=True)
+            sf_high = None
+            if {14, 2, 3, 4, 5}.issubset(set(flush_ranks)): sf_high = 5
+            for i in range(len(flush_ranks) - 4):
+                if flush_ranks[i] - flush_ranks[i+4] == 4:
+                    sf_high = flush_ranks[i]
+                    break
+            if sf_high: return f"Straight Flush ({HandEvaluator.rank_name(sf_high)} High)"
+
+        # Quads
+        rank_counts = {r: ranks.count(r) for r in ranks}
+        quads = [r for r, c in rank_counts.items() if c == 4]
+        if quads: return f"Four of a Kind ({HandEvaluator.rank_name(quads[0])}s)"
+        
+        # Full House
+        trips = [r for r, c in rank_counts.items() if c == 3]
+        pairs = [r for r, c in rank_counts.items() if c == 2]
+        
+        if trips:
+            high_trip = trips[0]
+            if len(trips) > 1 or pairs:
+                return f"Full House ({HandEvaluator.rank_name(high_trip)}s full)"
+        
+        if flush_suit: return "Flush"
+        
+        if straight_high: return f"Straight ({HandEvaluator.rank_name(straight_high)} High)"
+        
+        if trips: return f"Three of a Kind ({HandEvaluator.rank_name(trips[0])}s)"
+        
+        if len(pairs) >= 2: return f"Two Pair ({HandEvaluator.rank_name(pairs[0])}s & {HandEvaluator.rank_name(pairs[1])}s)"
+        
+        if pairs: return f"Pair of {HandEvaluator.rank_name(pairs[0])}s"
+        
+        return f"High Card ({HandEvaluator.rank_name(ranks[0])})"
+
+    @staticmethod
+    def rank_name(r):
+        return {11:'J', 12:'Q', 13:'K', 14:'A'}.get(r, str(r))
+
+
+def generate_strategy_prompt(history_json: str, action_history: str, villain_stats: str, 
+                             snapshot: GameSnapshot, metrics: dict, current_action: str, hand_rank: str) -> str:
+    """Constructs the final prompt for the Strategy LLM following Task 3 structure."""
+    
+    hero = next((p for p in snapshot.players if p.is_hero), None)
+    hero_cards = " ".join(hero.hole_cards) if hero and hero.hole_cards else "Unknown"
+    hero_pos = hero.name if hero else "Unknown"
+    board = " ".join(snapshot.board_state.community_cards) or "Preflop"
+    
+    final_pot = metrics.get("final_pot", snapshot.board_state.total_pot)
+    eff_stack = metrics.get("eff_stack", 0.0)
+    spr = metrics.get("spr", 0.0)
+    odds_str = metrics.get("pot_odds_str", "N/A")
+
+    return f"""
+You are a professional poker strategist. 
+
+Context:
+- Board: {board}
+- Hero Hand: {hero_cards}
+- Hand Rank: {hand_rank}
+- Position: {hero_pos}
+
+Villain Stats:
+{villain_stats}
+
+Action History:
+{action_history}
+
+Math:
+- Effective Stack: {eff_stack:.1f} BB
+- SPR: {spr:.2f}
+- Pot Odds: {odds_str}
+
+Current Situation:
+- Pot: {final_pot:.2f} BB
+- Pending Action: {current_action}
+
+Output Constraints:
+- DO NOT summarize the hand history.
+- DO NOT estimate specific equity percentages.
+- BE INSTANT.
+- Strictly follow the output format:
+Line 1: RECOMMENDATION: [ACTION] [SIZING]
+Line 2+: Max 3 bullet points of reasoning.
+"""
 
 
 def run_analysis_flow(mode: str = "debug"):
@@ -1110,63 +1327,52 @@ def run_analysis_flow(mode: str = "debug"):
                     pot_odds_ratio = "N/A"
                     pot_odds_str = "N/A (Facing 0 bet)"
                 
-                # Store metrics for display
+                # Store metrics for display and prompt
                 metrics = {
+                    "final_pot": final_pot,
                     "eff_stack": eff_stack,
                     "spr": spr,
                     "pot_odds_pct": pot_odds_pct,
-                    "pot_odds_ratio": pot_odds_ratio
+                    "pot_odds_ratio": pot_odds_ratio,
+                    "pot_odds_str": pot_odds_str
                 }
 
                 # --- VILLAIN PROFILING (HUD) ---
                 history_hands = load_all_sessions()
+                save_villain_db(history_hands) # Update readable DB file
+                
+                # USERNAME EXCLUSION (Don't track yourself as a villain)
+                MY_USERNAMES = ["biba287"] 
+
                 villain_profiles = []
                 for p in snapshot.players:
-                    if not p.is_hero and p.status in ["ACTIVE", "ALL_IN"]:
-                        stats = calculate_villain_stats(p.name, history_hands)
-                        villain_profiles.append(f"- {p.name} ({p.status}): {stats}")
+                    # Skip if Hero or if it's one of my known usernames
+                    if p.is_hero or p.username in MY_USERNAMES:
+                        continue
+                        
+                    if p.status in ["ACTIVE", "ALL_IN"]:
+                        # Track by Username (e.g. "Player123"), show Position (e.g. "BTN")
+                        lookup_name = p.username if p.username else p.name
+                        stats = calculate_villain_stats(lookup_name, history_hands)
+                        villain_profiles.append(f"- {lookup_name} ({p.name}): {stats}")
                 
                 villain_context = "\n".join(villain_profiles) if villain_profiles else "- Unknown/Random"
 
                 # Define current action for the prompt
                 current_action = f"Facing bet/raise of {call_amount} BB" if call_amount > 0 else "Checked to Hero"
+                
+                # Calculate Hand Rank
+                hand_rank = HandEvaluator.evaluate(hero.hole_cards, snapshot.board_state.community_cards)
 
-                # Build strategy prompt with FULL HISTORY
-                history_json = current_history.to_json()
-                action_summary = parse_action_history(history_json)
+                # Build strategy prompt
+                history_full = current_history.to_json()
+                history_min = current_history.to_min_json()
+                action_summary = parse_action_history(history_full)
                 
-                strategy_prompt = f"""
-                You are a professional poker strategist. 
-                
-                ACTION HISTORY (Summary):
-                {action_summary}
-                
-                FULL HAND HISTORY (JSON):
-                {history_json}
-                
-                CURRENT SITUATION:
-                - Board: {" ".join(snapshot.board_state.community_cards)}
-                - Hero: {" ".join(hero.hole_cards)} ({hero.name})
-                - Position: {hero.name}
-                - Pot: {final_pot:.2f} BB
-                - Call: {call_amount} BB
-                - Action: {current_action}
-                - Villain Profiles:
-                {villain_context}
-                
-                MATH & METRICS (Calculated):
-                - Effective Stack: {eff_stack:.1f} BB
-                - SPR: {spr:.2f}
-                - Pot Odds: {pot_odds_str}
-                
-                OUTPUT FORMAT (STRICT):
-                Line 1: RECOMMENDATION: [ACTION] [SIZING] (e.g. "RECOMMENDATION: FOLD")
-                Line 2+: Max 3 bullet points of KEY reasoning.
-                
-                DO NOT summarize the hand history.
-                DO NOT estimate specific equity percentages.
-                BE INSTANT.
-                """
+                strategy_prompt = generate_strategy_prompt(
+                    history_min, action_summary, villain_context, 
+                    snapshot, metrics, current_action, hand_rank
+                )
                 
                 # Debug prompt
                 with open("debug_strategy_prompt.txt", "w") as f:
@@ -1182,7 +1388,8 @@ def run_analysis_flow(mode: str = "debug"):
         t_total = time.time() - start_total
         
         # 4. Display
-        display_results(snapshot, analysis, t_capture, t_vision, t_strategy, t_total, metrics)
+        hand_rank = hand_rank if mode == "strategy" else ""
+        display_results(snapshot, analysis, t_capture, t_vision, t_strategy, t_total, metrics, hand_rank)
         
         # Show history summary
         # console.print(f"\n[dim]{current_history.summary()}[/dim]")
