@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Optional
 from dotenv import load_dotenv
 import mss
-from PIL import Image
+from PIL import Image, ImageChops
 from rich.console import Console
 from rich.table import Table
 from pynput import keyboard
@@ -198,10 +198,13 @@ VISUAL ANALYSIS INSTRUCTIONS (STRICT HIERARCHY):
    - **EMPTY:** - No Name, no chips, black background.
 
 2. STEP TWO: EXTRACT ATTRIBUTES (Independent of Status):
-   - **STACK SIZE:** Extract the number inside the player pod if visible. If status is 'Sitting Out', this is likely null/0.
-   - **CURRENT BET:** A *separate* graphical element (pill/oval/chip icon) located *outside* or *next to* the player pod.
-     - *Crucial:* Check for this bubble for ALL players (Active, Folded, or Sitting Out).
-     - *Scenario:* A folded player might still have a bet bubble (dead money) from earlier action.
+   - **STACK SIZE (CRITICAL - CONVERT TO BB):** 
+     - Extract the number inside the player pod.
+     - **IF CURRENCY DETECTED (e.g. "$2.00", "€5.00"):** Convert to BBs assuming Big Blind = 0.02 (e.g. 2.00 -> 100 BB).
+     - **IF NUMBER ONLY:** Assume it is already in BBs.
+   - **CURRENT BET (CONVERT TO BB):** 
+     - Look for the bet bubble/pill. Apply same conversion rules (Currency -> BB).
+     - *Crucial:* Check for this bubble for ALL players.
    - **DEALER BUTTON:** Look for a small white circular disk with a black "D". It can be next to any player type.
 
 3. HERO IDENTIFICATION (Seat 5):
@@ -214,8 +217,8 @@ OUTPUT FORMAT (JSON ONLY):
     {
       "seat_index": <0-5, corresponding to image order>,
       "name": <String or null>,
-      "stack_size_bb": <Float or 0 if sitting out>,
-      "current_bet_bb": <Float (Check for bet bubble even if folded!)>,
+      "stack_size_bb": <Float (IN BBs)>,
+      "current_bet_bb": <Float (IN BBs)>,
       "has_cards": <Boolean - True ONLY if cards visible>,
       "is_folded": <Boolean - True if Stack visible but NO cards>,
       "is_sitting_out": <Boolean - True if Name present but NO Stack>,
@@ -224,7 +227,7 @@ OUTPUT FORMAT (JSON ONLY):
     }
   ],
   "board_cards": [<list of community cards>],
-  "total_pot_bb": <Float from pot info>,
+  "total_pot_bb": <Float in BB>,
   "hero_context": {
     "is_turn": <Boolean>,
     "action_options": ["Check", "Call", "Raise"]
@@ -803,9 +806,11 @@ def display_results(snapshot: GameSnapshot, analysis: str, t_cap, t_vis, t_strat
 monitor_num = 1
 running = True
 last_state = None
+last_captures = None
 input_mode = None
 note_player = ""
 current_history = HandHistory()  # Accumulates snapshots for current hand
+recorder = GameRecorder() # Enable logging
 
 
 def run_analysis_flow(mode: str = "debug"):
@@ -830,6 +835,7 @@ def run_analysis_flow(mode: str = "debug"):
         
         # 2. Hand History - Always add snapshot (user presses 'n' for new hand)
         current_history.add_snapshot(snapshot)
+        recorder.update(snapshot) # Log to file
         console.print(f"[dim]📝 Turn {len(current_history.snapshots)} added to history[/dim]")
         
         analysis = ""
@@ -847,24 +853,29 @@ def run_analysis_flow(mode: str = "debug"):
                 # Build strategy prompt with FULL HISTORY
                 history_json = current_history.to_json()
                 strategy_prompt = f"""
-                You are a professional poker strategist. Analyze this hand history and recommend the best action.
+                You are a professional poker strategist. 
                 
-                FULL HAND HISTORY (all turns so far):
+                FULL HAND HISTORY:
                 {history_json}
                 
                 CURRENT SITUATION:
-                - Street: {snapshot.meta_info.current_street}
                 - Board: {" ".join(snapshot.board_state.community_cards)}
-                - Hero Cards: {" ".join(hero.hole_cards)}
+                - Hero: {" ".join(hero.hole_cards)}
                 - Pot: {snapshot.board_state.total_pot} BB
-                - Amount to Call: {snapshot.last_action_context.amount_to_call} BB
+                - Call: {snapshot.last_action_context.amount_to_call} BB
                 
                 OUTPUT FORMAT (STRICT):
-                Line 1: RECOMMENDATION: [ACTION] [SIZING] (e.g., "RECOMMENDATION: RAISE to 2.5BB" or "RECOMMENDATION: FOLD")
-                Line 2+: Concise reasoning (bullet points).
+                Line 1: RECOMMENDATION: [ACTION] [SIZING] (e.g. "RECOMMENDATION: FOLD")
+                Line 2+: Max 3 bullet points of KEY reasoning.
                 
-                Be extremely concise.
+                DO NOT summarize the hand history.
+                DO NOT estimate specific equity percentages.
+                BE INSTANT.
                 """
+                
+                # Debug prompt
+                with open("debug_strategy_prompt.txt", "w") as f:
+                    f.write(strategy_prompt)
                 
                 try:
                     resp = strategy_model.generate_content(strategy_prompt)
