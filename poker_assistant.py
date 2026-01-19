@@ -844,6 +844,181 @@ current_history = HandHistory()  # Accumulates snapshots for current hand
 recorder = GameRecorder() # Enable logging
 
 
+def parse_action_history(history_json: str) -> str:
+    """Generates a human-readable summary of the action line from JSON history."""
+    try:
+        data = json.loads(history_json)
+        turns = data.get("turns", [])
+    except:
+        return "History parsing failed."
+        
+    if not turns: return "No history."
+    
+    output_lines = []
+    current_street = None
+    street_actions = []
+    
+    for i, turn in enumerate(turns):
+        meta = turn.get("meta_info", {})
+        street = meta.get("current_street", "UNKNOWN")
+        
+        # New Street Handling
+        if street != current_street:
+            if current_street and street_actions:
+                output_lines.append(f"{current_street}: {', '.join(street_actions)}.")
+            current_street = street
+            street_actions = []
+            
+        # Skip first snapshot as base
+        if i == 0: continue
+        
+        prev = turns[i-1]
+        curr = turn
+        
+        # Detect Actions
+        # 1. Folds
+        for p_idx, p_curr in enumerate(curr["players"]):
+            # Safety check for list length
+            if p_idx >= len(prev["players"]): break
+            p_prev = prev["players"][p_idx]
+            
+            if p_curr["status"] == "FOLDED" and p_prev["status"] != "FOLDED":
+                name = p_curr["name"] or f"S{p_curr['seat_index']+1}"
+                street_actions.append(f"{name} Folds")
+
+        # 2. Bets/Calls/Raises
+        prev_max_bet = max((p["current_bet"] for p in prev["players"]), default=0.0)
+        
+        # Check who acted (Action moved from Prev Actor)
+        # Or simply check state changes for all players
+        for p_idx, p_curr in enumerate(curr["players"]):
+            if p_idx >= len(prev["players"]): break
+            p_prev = prev["players"][p_idx]
+            
+            if p_curr["status"] == "FOLDED": continue
+            
+            curr_bet = p_curr["current_bet"]
+            prev_bet = p_prev["current_bet"]
+            
+            if curr_bet > prev_bet:
+                name = p_curr["name"] or f"S{p_curr['seat_index']+1}"
+                
+                # Logic: Call vs Bet vs Raise
+                if curr_bet <= prev_max_bet and prev_max_bet > 0:
+                    street_actions.append(f"{name} Calls {curr_bet}")
+                elif prev_max_bet == 0:
+                    street_actions.append(f"{name} Bets {curr_bet}")
+                else:
+                    street_actions.append(f"{name} Raises to {curr_bet}")
+
+        # 3. Checks
+        # If action moved from A to B, and A didn't put more money, A checked.
+        prev_actor_idx = prev["action_on_seat_index"]
+        if prev_actor_idx != curr["action_on_seat_index"]:
+             # Check if previous actor checked
+             if prev_actor_idx < len(prev["players"]) and prev_actor_idx < len(curr["players"]):
+                 p_prev_actor = prev["players"][prev_actor_idx]
+                 p_curr_actor = curr["players"][prev_actor_idx]
+                 
+                 if p_curr_actor["status"] == "ACTIVE":
+                     if p_curr_actor["current_bet"] == p_prev_actor["current_bet"]:
+                         # No money added
+                         if p_curr_actor["current_bet"] == prev_max_bet:
+                             # Matches table max (or 0) -> Check
+                             name = p_curr_actor["name"] or f"S{prev_actor_idx+1}"
+                             street_actions.append(f"{name} Checks")
+
+    # Flush last street
+    if current_street and street_actions:
+        output_lines.append(f"{current_street}: {', '.join(street_actions)}.")
+        
+    return "\n".join(output_lines)
+
+
+def load_all_sessions() -> list:
+    """Loads all session JSONL files and groups snapshots into hands."""
+    hands = {}
+    base_dir = os.path.dirname(__file__)
+    for file in os.listdir(base_dir):
+        if file.startswith("session_") and file.endswith(".jsonl"):
+            try:
+                with open(os.path.join(base_dir, file), "r") as f:
+                    for line in f:
+                        try:
+                            data = json.loads(line)
+                            if "hand_id" in data:
+                                hid = data["hand_id"]
+                                if hid not in hands: hands[hid] = []
+                                hands[hid].append(data)
+                        except: continue
+            except: continue
+    return list(hands.values())
+
+
+def calculate_villain_stats(villain_name: str, past_hands_list: list) -> str:
+    """Calculates VPIP, PFR, and AF for a player based on past hands."""
+    if not past_hands_list or not villain_name or villain_name == "Unknown":
+        return "Unknown (0 hands)"
+    
+    total_hands = 0
+    vpip_hands = 0
+    pfr_hands = 0
+    agg_actions = 0
+    pass_actions = 0
+    
+    for snapshots in past_hands_list:
+        player_seen = False
+        vpiped = False
+        pfrd = False
+        
+        # Sort snapshots by timestamp
+        snapshots.sort(key=lambda x: x.get("timestamp", ""))
+        
+        for i, curr in enumerate(snapshots):
+            players = curr.get("players", [])
+            p_curr = next((p for p in players if p.get("name") == villain_name), None)
+            if not p_curr: continue
+            
+            player_seen = True
+            street = curr.get("meta_info", {}).get("current_street")
+            
+            if i > 0:
+                prev = snapshots[i-1]
+                p_prev = next((p for p in prev.get("players", []) if p.get("name") == villain_name), None)
+                if p_prev:
+                    curr_bet = p_curr.get("current_bet", 0)
+                    prev_bet = p_prev.get("current_bet", 0)
+                    
+                    if street == "PREFLOP":
+                        bb = curr.get("meta_info", {}).get("blind_level", {}).get("bb", 0.02)
+                        if curr_bet > prev_bet and curr_bet > bb: 
+                            vpiped = True
+                        if curr.get("last_action_context", {}).get("aggressor_seat_index") == p_curr.get("seat_index"):
+                            pfrd = True
+                    
+                    if curr_bet > prev_bet:
+                        prev_max = max((p.get("current_bet", 0) for p in prev.get("players", [])), default=0)
+                        if curr_bet > prev_max: agg_actions += 1
+                        else: pass_actions += 1 # Call
+                    elif p_curr.get("status") == "FOLDED" and p_prev.get("status") != "FOLDED":
+                        pass_actions += 1
+                    elif p_curr.get("status") == "ACTIVE" and curr_bet == prev_bet:
+                        if prev.get("action_on_seat_index") == p_curr.get("seat_index"):
+                            pass_actions += 1 # Check
+                            
+        if player_seen:
+            total_hands += 1
+            if vpiped: vpip_hands += 1
+            if pfrd: pfr_hands += 1
+            
+    if total_hands == 0: return "Unknown (0 hands)"
+    vpip = (vpip_hands / total_hands) * 100
+    pfr = (pfr_hands / total_hands) * 100
+    af = agg_actions / max(pass_actions, 1)
+    
+    return f"VPIP: {vpip:.0f}% | PFR: {pfr:.0f}% | AF: {af:.1f} (Sample: {total_hands} hands)"
+
+
 def run_analysis_flow(mode: str = "debug"):
     """
     Main Logic Flow:
@@ -943,15 +1118,30 @@ def run_analysis_flow(mode: str = "debug"):
                     "pot_odds_ratio": pot_odds_ratio
                 }
 
+                # --- VILLAIN PROFILING (HUD) ---
+                history_hands = load_all_sessions()
+                villain_profiles = []
+                for p in snapshot.players:
+                    if not p.is_hero and p.status in ["ACTIVE", "ALL_IN"]:
+                        stats = calculate_villain_stats(p.name, history_hands)
+                        villain_profiles.append(f"- {p.name} ({p.status}): {stats}")
+                
+                villain_context = "\n".join(villain_profiles) if villain_profiles else "- Unknown/Random"
+
                 # Define current action for the prompt
                 current_action = f"Facing bet/raise of {call_amount} BB" if call_amount > 0 else "Checked to Hero"
 
                 # Build strategy prompt with FULL HISTORY
                 history_json = current_history.to_json()
+                action_summary = parse_action_history(history_json)
+                
                 strategy_prompt = f"""
                 You are a professional poker strategist. 
                 
-                FULL HAND HISTORY:
+                ACTION HISTORY (Summary):
+                {action_summary}
+                
+                FULL HAND HISTORY (JSON):
                 {history_json}
                 
                 CURRENT SITUATION:
@@ -961,7 +1151,8 @@ def run_analysis_flow(mode: str = "debug"):
                 - Pot: {final_pot:.2f} BB
                 - Call: {call_amount} BB
                 - Action: {current_action}
-                - Villain Profile: Unknown/Random
+                - Villain Profiles:
+                {villain_context}
                 
                 MATH & METRICS (Calculated):
                 - Effective Stack: {eff_stack:.1f} BB
