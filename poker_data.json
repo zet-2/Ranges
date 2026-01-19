@@ -1,0 +1,37 @@
+{
+    "ranges": {
+        "6max": {
+            "UTG": {
+                "open": "AA-22, AKs-A2s, KQs-K9s, QJs-Q9s, JTs-J9s, T9s-T8s, 98s-97s, 87s-76s, 65s-54s, AKo-ATo, KQo-KJo, QJo",
+                "vs_3bet": "AA-QQ, AKs-AQs, AKo",
+                "description": "Tight from early position, ~15% of hands"
+            },
+            "MP": {
+                "open": "AA-22, AKs-A2s, KQs-K7s, QJs-Q8s, JTs-J8s, T9s-T7s, 98s-96s, 87s-75s, 65s-54s, AKo-A9o, KQo-KTo, QJo-QTo, JTo",
+                "vs_3bet": "AA-JJ, AKs-AJs, KQs, AKo-AQo",
+                "description": "Slightly wider, ~18% of hands"
+            },
+            "CO": {
+                "open": "AA-22, AKs-A2s, KQs-K2s, QJs-Q5s, JTs-J7s, T9s-T6s, 98s-95s, 87s-84s, 76s-74s, 65s-63s, 54s-53s, 43s, AKo-A2o, KQo-K9o, QJo-Q9o, JTo-J9o, T9o",
+                "vs_3bet": "AA-TT, AKs-ATs, KQs-KJs, QJs, AKo-AJo, KQo",
+                "description": "Wide stealing range, ~25% of hands"
+            },
+            "BTN": {
+                "open": "AA-22, AKs-A2s, KQs-K2s, QJs-Q2s, JTs-J4s, T9s-T5s, 98s-94s, 87s-83s, 76s-72s, 65s-62s, 54s-52s, 43s-42s, 32s, AKo-A2o, KQo-K5o, QJo-Q7o, JTo-J8o, T9o-T8o, 98o-97o, 87o",
+                "vs_3bet": "AA-99, AKs-A9s, KQs-KTs, QJs-QTs, JTs, AKo-ATo, KQo-KJo, QJo",
+                "description": "Very wide, ~40% of hands"
+            },
+            "SB": {
+                "open": "AA-22, AKs-A2s, KQs-K4s, QJs-Q6s, JTs-J7s, T9s-T7s, 98s-96s, 87s-85s, 76s-74s, 65s-64s, 54s, AKo-A4o, KQo-K8o, QJo-Q9o, JTo-J9o, T9o",
+                "vs_3bet": "AA-TT, AKs-AJs, KQs, AKo-AQo",
+                "description": "Wide vs BB only, ~35% of hands"
+            },
+            "BB": {
+                "defend_vs_open": "AA-22, AKs-A2s, KQs-K2s, QJs-Q4s, JTs-J6s, T9s-T6s, 98s-95s, 87s-84s, 76s-73s, 65s-63s, 54s-53s, 43s, AKo-A2o, KQo-K7o, QJo-Q8o, JTo-J8o, T9o-T8o, 98o-97o, 87o",
+                "3bet": "AA-TT, AKs-ATs, KQs-KJs, QJs, A5s-A4s, AKo-AQo",
+                "description": "Wide defense due to pot odds"
+            }
+        }
+    },
+    "notes": {}
+}

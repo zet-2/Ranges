@@ -1,335 +1,942 @@
 #!/usr/bin/env python3
 """
 Poker Range Assistant - Real-time PokerStars table analyzer
-Uses Gemini Vision API to parse table state and estimate opponent ranges.
+Press 'j' to analyze | 'p' for preflop chart | 'n' to add note | ESC to exit
 """
 
 import os
 import sys
+import json
 import time
-import io
-import base64
+import dataclasses
 from dataclasses import dataclass
 from typing import Optional
 from dotenv import load_dotenv
 import mss
-import mss.tools
 from PIL import Image
 from rich.console import Console
 from rich.table import Table
-from rich.panel import Panel
-from rich.live import Live
-from rich.layout import Layout
+from pynput import keyboard
 import google.generativeai as genai
 
 load_dotenv()
-
 console = Console()
 
 # Configure Gemini
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
-    console.print("[red]Error: GEMINI_API_KEY not found in .env file[/red]")
+    console.print("[red]Error: GEMINI_API_KEY not found in .env[/red]")
     sys.exit(1)
 
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-2.0-flash")
+
+# Initialize Dual Models
+# Switching to 2.0 Flash for Vision as well for speed (3.0 Preview is high latency)
+vision_model = genai.GenerativeModel("gemini-2.0-flash-exp")    
+strategy_model = genai.GenerativeModel("gemini-2.0-flash")
+
+# Data file path
+DATA_FILE = os.path.join(os.path.dirname(__file__), "poker_data.json")
+
+
+def load_data() -> dict:
+    """Load poker data (ranges + notes)."""
+    try:
+        with open(DATA_FILE, 'r') as f:
+            return json.load(f)
+    except:
+        return {"ranges": {}, "notes": {}}
+
+
+def save_data(data: dict):
+    """Save poker data."""
+    with open(DATA_FILE, 'w') as f:
+        json.dump(data, f, indent=2)
+
+
+
+# ---------------------------------------------------------
+# PROFESSIONAL DATA STRUCTURES
+# ---------------------------------------------------------
+
+@dataclass
+class MetaInfo:
+    blind_level: dict = dataclasses.field(default_factory=lambda: {"sb": 0.01, "bb": 0.02, "ante": 0})
+    table_size: int = 6
+    current_street: str = "PREFLOP" # PREFLOP, FLOP, TURN, RIVER
+
+@dataclass
+class BoardState:
+    community_cards: list = dataclasses.field(default_factory=list)
+    total_pot: float = 0.0
+    current_pot_odds: float = 0.0
+
+@dataclass
+class Player:
+    seat_index: int
+    name: str = ""
+    stack_size: float = 0.0
+    hole_cards: list = None # ["Ah", "Kd"] or None
+    current_bet: float = 0.0 # Chips currently in front
+    status: str = "FOLDED" # ACTIVE, FOLDED, ALL_IN, SITTING_OUT
+    is_hero: bool = False
+    is_dealer: bool = False # Helper field
+
+@dataclass
+class LastActionContext:
+    aggressor_seat_index: int = -1
+    last_aggressive_action: str = "NONE" # BET, RAISE, CHECK
+    amount_to_call: float = 0.0
+
+@dataclass
+class GameSnapshot:
+    hand_id: str = ""
+    timestamp: str = ""
+    meta_info: MetaInfo = dataclasses.field(default_factory=MetaInfo)
+    board_state: BoardState = dataclasses.field(default_factory=BoardState)
+    dealer_seat_index: int = 0
+    action_on_seat_index: int = 0
+    players: list[Player] = dataclasses.field(default_factory=list)
+    last_action_context: LastActionContext = dataclasses.field(default_factory=LastActionContext)
+    
+    def to_json(self):
+        return json.dumps(dataclasses.asdict(self), indent=2)
 
 
 @dataclass
-class TableState:
-    """Parsed poker table state"""
-    hero_cards: str = ""
-    board: str = ""
-    pot_size: str = ""
-    hero_position: str = ""
-    street: str = ""  # preflop, flop, turn, river
-    villain_actions: list = None
-    villain_positions: list = None
-    hero_stack: str = ""
-    villain_stacks: dict = None
-    current_bet: str = ""
-    hero_to_act: bool = False
+class HandHistory:
+    """Accumulates snapshots for a single hand."""
+    hand_id: str = ""
+    snapshots: list = dataclasses.field(default_factory=list)
+    last_action_on: int = -1
+    last_street: str = ""
     
-    def __post_init__(self):
-        if self.villain_actions is None:
-            self.villain_actions = []
-        if self.villain_positions is None:
-            self.villain_positions = []
-        if self.villain_stacks is None:
-            self.villain_stacks = {}
-
-
-PARSE_PROMPT = """Analyze this PokerStars poker table screenshot. Extract the following information in a structured format:
-
-1. HERO_CARDS: The two cards the hero (bottom player) is holding. Format: "As Kh" (rank + suit letter: s=spades, h=hearts, d=diamonds, c=clubs). If not visible, say "unknown".
-
-2. BOARD: Community cards on the table. Format: "Js Tc 4d 2h" or empty if preflop.
-
-3. POT: Total pot size (number only, e.g., "150").
-
-4. HERO_POSITION: Hero's position (BTN, SB, BB, UTG, MP, CO, etc.).
-
-5. STREET: Current street (preflop, flop, turn, river).
-
-6. VILLAIN_ACTIONS: List each villain's actions this hand in order. Format: "Position: action (amount)" 
-   Example: "UTG: raise 3bb, CO: call, BTN: fold"
-
-7. CURRENT_BET: Amount hero needs to call (0 if checking).
-
-8. HERO_TO_ACT: Is it hero's turn to act? (yes/no)
-
-9. ACTIVE_VILLAINS: Positions of players still in the hand.
-
-10. STACK_SIZES: Approximate stack sizes of active players.
-
-Respond in this EXACT format (keep the labels):
-HERO_CARDS: [cards]
-BOARD: [cards or empty]
-POT: [amount]
-HERO_POSITION: [position]
-STREET: [street]
-VILLAIN_ACTIONS: [actions]
-CURRENT_BET: [amount]
-HERO_TO_ACT: [yes/no]
-ACTIVE_VILLAINS: [positions]
-STACKS: [position: amount, ...]
-
-If you cannot determine something clearly, use "unknown"."""
-
-
-RANGE_PROMPT = """You are an expert poker range analyst. Based on the following game state, estimate the likely hand ranges for each active villain.
-
-Game State:
-- Street: {street}
-- Pot: {pot}
-- Board: {board}
-- Villain Actions: {villain_actions}
-- Active Villain Positions: {active_villains}
-
-For each villain, provide:
-1. Their estimated hand range using standard notation (e.g., "AA-TT, AKs-AJs, AKo-AQo, KQs")
-2. Range as percentage of all hands (e.g., "~8%")
-3. Brief reasoning
-
-Consider:
-- Position awareness (early position = tighter, late = wider)
-- Action strength (raise = stronger than call, check-raise = very strong)
-- Board texture interaction
-- Typical player tendencies at low/mid stakes
-
-Format:
-VILLAIN [position]:
-Range: [hands]
-Percentage: [%]
-Reasoning: [brief explanation]
----"""
-
-
-def capture_screen(monitor_num: int = 1) -> Image.Image:
-    """Capture screenshot of the specified monitor."""
-    with mss.mss() as sct:
-        monitors = sct.monitors
-        if monitor_num >= len(monitors):
-            monitor_num = 1  # Default to primary
+    def is_new_hand(self, snapshot: GameSnapshot) -> bool:
+        """Detect if this snapshot is from a new hand."""
+        if not self.snapshots:
+            return True
         
-        monitor = monitors[monitor_num]
-        screenshot = sct.grab(monitor)
-        img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
-        return img
-
-
-def image_to_base64(img: Image.Image) -> str:
-    """Convert PIL Image to base64 string."""
-    buffer = io.BytesIO()
-    img.save(buffer, format="PNG")
-    return base64.b64encode(buffer.getvalue()).decode()
-
-
-def parse_table_response(response_text: str) -> TableState:
-    """Parse Gemini's response into a TableState object."""
-    state = TableState()
+        last = self.snapshots[-1]
+        
+        # New hand if board goes from cards to empty
+        if len(last.board_state.community_cards) > 0 and len(snapshot.board_state.community_cards) == 0:
+            return True
+        
+        # New hand if hero's cards change
+        last_hero = next((p for p in last.players if p.is_hero), None)
+        new_hero = next((p for p in snapshot.players if p.is_hero), None)
+        if last_hero and new_hero:
+            if last_hero.hole_cards and new_hero.hole_cards:
+                if last_hero.hole_cards != new_hero.hole_cards:
+                    return True
+        
+        return False
     
-    lines = response_text.strip().split('\n')
-    for line in lines:
-        line = line.strip()
-        if line.startswith("HERO_CARDS:"):
-            state.hero_cards = line.split(":", 1)[1].strip()
-        elif line.startswith("BOARD:"):
-            state.board = line.split(":", 1)[1].strip()
-        elif line.startswith("POT:"):
-            state.pot_size = line.split(":", 1)[1].strip()
-        elif line.startswith("HERO_POSITION:"):
-            state.hero_position = line.split(":", 1)[1].strip()
-        elif line.startswith("STREET:"):
-            state.street = line.split(":", 1)[1].strip()
-        elif line.startswith("VILLAIN_ACTIONS:"):
-            state.villain_actions = line.split(":", 1)[1].strip()
-        elif line.startswith("CURRENT_BET:"):
-            state.current_bet = line.split(":", 1)[1].strip()
-        elif line.startswith("HERO_TO_ACT:"):
-            state.hero_to_act = "yes" in line.lower()
-        elif line.startswith("ACTIVE_VILLAINS:"):
-            villains = line.split(":", 1)[1].strip()
-            state.villain_positions = [v.strip() for v in villains.split(",") if v.strip()]
-        elif line.startswith("STACKS:"):
-            stacks = line.split(":", 1)[1].strip()
-            for pair in stacks.split(","):
-                if ":" in pair:
-                    pos, amt = pair.split(":", 1)
-                    state.villain_stacks[pos.strip()] = amt.strip()
+    def is_new_turn(self, snapshot: GameSnapshot) -> bool:
+        """Detect if action has moved to a new player or street changed."""
+        # Street changed
+        if snapshot.meta_info.current_street != self.last_street:
+            return True
+        
+        # Action moved to new player
+        if snapshot.action_on_seat_index != self.last_action_on:
+            return True
+        
+        return False
     
-    return state
-
-
-def analyze_table(img: Image.Image) -> Optional[TableState]:
-    """Send screenshot to Gemini and parse table state."""
-    try:
-        response = model.generate_content([PARSE_PROMPT, img])
-        return parse_table_response(response.text)
-    except Exception as e:
-        console.print(f"[red]Error analyzing table: {e}[/red]")
-        return None
-
-
-def estimate_ranges(state: TableState) -> str:
-    """Get range estimates for active villains."""
-    if not state.villain_positions or state.villain_positions == ["unknown"]:
-        return "No active villains detected"
+    def add_snapshot(self, snapshot: GameSnapshot):
+        """Add snapshot and update tracking."""
+        self.snapshots.append(snapshot)
+        self.last_action_on = snapshot.action_on_seat_index
+        self.last_street = snapshot.meta_info.current_street
+        self.hand_id = snapshot.hand_id
     
-    prompt = RANGE_PROMPT.format(
-        street=state.street,
-        pot=state.pot_size,
-        board=state.board if state.board else "none (preflop)",
-        villain_actions=state.villain_actions,
-        active_villains=", ".join(state.villain_positions)
-    )
+    def reset(self):
+        """Start fresh for new hand."""
+        self.snapshots = []
+        self.last_action_on = -1
+        self.last_street = ""
+        self.hand_id = ""
     
-    try:
-        response = model.generate_content(prompt)
-        return response.text
-    except Exception as e:
-        return f"Error estimating ranges: {e}"
+    def to_json(self) -> str:
+        """Format history for strategist."""
+        history = {
+            "hand_id": self.hand_id,
+            "total_turns": len(self.snapshots),
+            "turns": [dataclasses.asdict(s) for s in self.snapshots]
+        }
+        return json.dumps(history, indent=2)
+    
+    def summary(self) -> str:
+        """Quick text summary of the hand so far."""
+        if not self.snapshots:
+            return "No history yet"
+        
+        lines = [f"Hand {self.hand_id} - {len(self.snapshots)} turns tracked"]
+        for i, s in enumerate(self.snapshots):
+            ctx = s.last_action_context
+            lines.append(f"  Turn {i+1}: {s.meta_info.current_street} | Pot: {s.board_state.total_pot}bb | Action: Seat {s.action_on_seat_index+1}")
+        return "\n".join(lines)
 
 
-def calculate_simple_equity(hero_cards: str, villain_range: str, board: str) -> str:
+ANALYZE_PROMPT = """Analyze these 8 images to construct a precise poker game state.
+Images 1-6: Seats 1 through 6.
+Image 7: Board (Community Cards + Pot Info).
+Image 8: Action Buttons (Fold/Call/Raise) - Critical for determining Hero's turn.
+
+CRITICAL VISUAL CUES:
+- ACTIVE player: Has cards with RED back visible
+- FOLDED player: No cards visible (cards were folded away)
+- SITTING OUT: No balance shown under name, OR text says "Sitting out"
+- Dealer: Look for a "white D button" next to the player
+
+IMPORTANT: The stack is ALWAYS shown as "X.X BB" text below the username.
+
+Check Image 8 to see if action buttons are visible (meaning it's Hero's turn).
+
+JSON OUTPUT FORMAT:
+{
+  "seats": [
+    { 
+      "seat_index": 0, # (Seat 1 = Index 0, Seat 6 = Index 5)
+      "stack_size_bb": number, 
+      "current_bet_bb": number, # Look for small numeric text near cards/avatar representing chips in the pot (NOT the stack).
+      "has_cards": boolean, # TRUE if cards are visible (Face-UP for Hero, or Red backs for others)
+      "is_folded": boolean, # TRUE if player had cards but folded (no cards visible now)
+      "is_sitting_out": boolean, # TRUE if no balance shown or "Sitting out" text
+      "is_dealer": boolean,
+      "hole_cards": ["card1", "card2"] or null # CRITICAL: DOUBLE CHECK Seat 5 (Index 4) for cards!
+    },
+    ... (repeat for all 6 seats)
+  ],
+  "board_cards": ["card", "card"...],
+  "total_pot_bb": number,
+  "hero_context": {
+    "is_turn": true,
+    "amount_to_call_bb": biggest current bet
+  }
+}"""
+
+# boolean, # True if buttons are visible in Image 8
+# (Prompt for Strategy remains similar but consumes this JSON)
+
+
+def get_position_label(seat_num: int, dealer_seat_index: int) -> str:
     """
-    Simplified equity estimation based on hand strength.
-    For accurate equity, you'd use a proper equity calculator library.
+    Calculate poker position label for a seat in 6-max.
+    seat_num: 1-6 (human readable)
+    dealer_seat_index: 0-5 (0-indexed)
+    Returns: BTN, SB, BB, UTG, MP, CO
     """
-    # This is a simplified heuristic - for real use, integrate a proper equity calc
-    premium_hands = ["AA", "KK", "QQ", "JJ", "AKs", "AKo"]
-    strong_hands = ["TT", "99", "AQs", "AQo", "AJs", "KQs"]
+    # Convert dealer to 1-indexed
+    btn_seat = dealer_seat_index + 1
     
-    hero_clean = hero_cards.replace(" ", "").upper()
+    # Calculate position offset from BTN
+    # In 6-max clockwise: BTN -> SB -> BB -> UTG -> MP -> CO
+    positions = ["BTN", "SB", "BB", "UTG", "MP", "CO"]
     
-    # Very rough equity estimates
-    if any(h in hero_clean for h in ["AA", "KK"]):
-        return "~75-85% vs typical range"
-    elif any(h in hero_clean for h in ["QQ", "JJ", "AK"]):
-        return "~55-65% vs typical range"
-    elif any(h in hero_clean for h in ["TT", "99", "AQ"]):
-        return "~45-55% vs typical range"
-    else:
-        return "Equity depends on board texture"
+    # How many seats after BTN is this seat?
+    offset = (seat_num - btn_seat) % 6
+    return positions[offset]
 
 
-def create_display(state: TableState, ranges: str, equity: str) -> Panel:
-    """Create rich display panel for terminal output."""
-    # Main info table
-    info_table = Table(show_header=False, box=None, padding=(0, 2))
-    info_table.add_column("Label", style="cyan")
-    info_table.add_column("Value", style="white")
+def get_position_label_dynamic(seat_index: int, dealer_seat_index: int, active_seats: list) -> str:
+    """
+    Calculate position label considering only active (non-sitting-out) seats.
+    seat_index: 0-5
+    dealer_seat_index: 0-5
+    active_seats: list of seat indices that are NOT sitting out
+    """
+    if not active_seats:
+        return "?"
     
-    info_table.add_row("🃏 Hero Cards", f"[bold yellow]{state.hero_cards}[/bold yellow]")
-    info_table.add_row("📍 Position", state.hero_position)
-    info_table.add_row("🎯 Board", state.board if state.board else "[dim]preflop[/dim]")
-    info_table.add_row("💰 Pot", f"[green]{state.pot_size}[/green]")
-    info_table.add_row("📊 Street", state.street)
-    info_table.add_row("🎲 To Call", state.current_bet)
+    # Sort active seats in clockwise order starting from dealer
+    def distance_from_dealer(s):
+        return (s - dealer_seat_index) % 6
     
-    # Action status
-    if state.hero_to_act:
-        action_status = "[bold green]>>> YOUR ACTION <<<[/bold green]"
+    sorted_seats = sorted(active_seats, key=distance_from_dealer)
+    
+    # Position names based on number of active players
+    num_players = len(sorted_seats)
+    
+    if num_players == 2:
+        positions = ["BTN", "BB"]  # Heads up: BTN is SB
+    elif num_players == 3:
+        positions = ["BTN", "SB", "BB"]
+    elif num_players == 4:
+        positions = ["BTN", "SB", "BB", "CO"]
+    elif num_players == 5:
+        positions = ["BTN", "SB", "BB", "UTG", "CO"]
+    else:  # 6 players
+        positions = ["BTN", "SB", "BB", "UTG", "MP", "CO"]
+    
+    # Find this seat's position in the sorted order
+    try:
+        idx = sorted_seats.index(seat_index)
+        return positions[idx] if idx < len(positions) else f"P{idx+1}"
+    except ValueError:
+        return "?"
+
+
+# ... (ACTION_PROMPT remains same) ...
+
+
+# ---------------------------------------------------------
+# DEEP GAME RECONSTRUCTION (Removed old HandHistory - using new one above)
+# ---------------------------------------------------------
+
+
+
+
+
+
+
+
+# ---------------------------------------------------------
+# REGION DEFINITIONS (Calibrated for User Screen)
+# ---------------------------------------------------------
+# Note: User must verify these coordinates via calibration tool if they drift.
+# (Placeholders used where previous calibration was lost)
+SEAT_ZONES = {
+    "seat1": {"left": 39.83203125, "top": 153.62890625, "width": 283.7890625, "height": 135.609375},
+    "seat2": {"left": 373.20703125, "top": 90.53515625, "width": 234.67578125, "height": 146.4453125},
+    "seat3": {"left": 608.52734375, "top": 126.84765625, "width": 309.59375, "height": 165.41796875},
+    "seat4": {"left": 626.46484375, "top": 355.68359375, "width": 314.81640625, "height": 119.01171875},
+    "hero":  {"left": 335.921875, "top": 413.3359375, "width": 263.04296875, "height": 167.8828125}, # Seat 5
+    "seat6": {"left": 15.7578125, "top": 346.51953125, "width": 340.4765625, "height": 125.2890625},
+    "board": {"top": 249, "left": 308, "width": 346, "height": 155} 
+}
+BUTTONS_REGION = {"left": 472, "top": 579, "width": 483, "height": 141} # User provided
+
+DEBUG_DIR = os.path.join(os.path.dirname(__file__), "debug_images")
+
+def clear_debug_images():
+    """Clear all files in the debug_images directory."""
+    if os.path.exists(DEBUG_DIR):
+        for f in os.listdir(DEBUG_DIR):
+            file_path = os.path.join(DEBUG_DIR, f)
+            try:
+                os.remove(file_path)
+            except:
+                pass
     else:
-        action_status = "[dim]Waiting...[/dim]"
+        os.makedirs(DEBUG_DIR, exist_ok=True)
+
+def save_debug_images(captures: dict):
+    """Save captured regions to debug_images/ for verification."""
+    clear_debug_images()
+    for name, img in captures.items():
+        img.save(os.path.join(DEBUG_DIR, f"{name}.png"))
+    console.print(f"[dim]📸 Saved {len(captures)} debug images to {DEBUG_DIR}[/dim]")
+
+def capture_regions():
+    """Captures all defined regions from the screen."""
+    with mss.mss() as sct:
+        monitor = sct.monitors[monitor_num]
+        mon_left = monitor["left"]
+        mon_top = monitor["top"]
+        
+        captures = {}
+        
+        # 1. Capture Seats & Board
+        for name, zone in SEAT_ZONES.items():
+            region = {
+                "top": mon_top + int(zone["top"]),
+                "left": mon_left + int(zone["left"]),
+                "width": int(zone["width"]),
+                "height": int(zone["height"])
+            }
+            sct_img = sct.grab(region)
+            captures[name] = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+
+        # 2. Capture Buttons
+        btn_reg = {
+            "top": mon_top + int(BUTTONS_REGION["top"]),
+            "left": mon_left + int(BUTTONS_REGION["left"]),
+            "width": int(BUTTONS_REGION["width"]),
+            "height": int(BUTTONS_REGION["height"])
+        }
+        sct_img = sct.grab(btn_reg)
+        captures["buttons"] = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+        
+        # Save for debugging
+        save_debug_images(captures)
+        
+        return captures
+
+
+
+def parse_response(text: str) -> GameSnapshot:
+    """Parses Vision Response into a GameSnapshot."""
+    snapshot = GameSnapshot()
+    snapshot.timestamp = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+    snapshot.hand_id = str(int(time.time()))
     
-    # Build output
-    output = f"{info_table}\n\n"
-    output += f"[bold cyan]Villain Actions:[/bold cyan] {state.villain_actions}\n\n"
-    output += f"[bold magenta]═══ RANGE ESTIMATES ═══[/bold magenta]\n{ranges}\n\n"
-    output += f"[bold yellow]Equity:[/bold yellow] {equity}\n\n"
-    output += action_status
+    try:
+        # Clean up JSON
+        cleaned_text = text.strip()
+        if cleaned_text.startswith("```json"):
+            cleaned_text = cleaned_text[7:]
+        if cleaned_text.endswith("```"):
+            cleaned_text = cleaned_text[:-3]
+        
+        data = json.loads(cleaned_text.strip())
+        
+        # 1. Parse Board & Meta
+        board_cards = data.get("board_cards", [])
+        snapshot.board_state.community_cards = board_cards
+        snapshot.board_state.total_pot = float(data.get("total_pot_bb") or 0)
+        
+        # Deduce Street
+        bc_len = len(board_cards)
+        if bc_len == 0: snapshot.meta_info.current_street = "PREFLOP"
+        elif bc_len == 3: snapshot.meta_info.current_street = "FLOP"
+        elif bc_len == 4: snapshot.meta_info.current_street = "TURN"
+        elif bc_len == 5: snapshot.meta_info.current_street = "RIVER"
+        
+        # 2. Parse Players (Two-Pass for correct position labels)
+        seats_data = data.get("seats", [])
+        active_indices = []
+        temp_players = []
+        
+        # Pass 1: Create players and find dealer
+        for p_data in seats_data:
+            idx = p_data.get("seat_index", 0)
+            
+            player = Player(seat_index=idx)
+            player.stack_size = float(p_data.get("stack_size_bb") or 0)
+            player.current_bet = float(p_data.get("current_bet_bb") or 0)
+            player.is_hero = (idx == 4) # Assuming Seat 5 (Index 4) is Hero
+            player.is_dealer = p_data.get("is_dealer", False)
+            
+            # Hole Cards (Hero Only) - Check FIRST
+            hc = p_data.get("hole_cards")
+            if player.is_hero and hc and isinstance(hc, list):
+                player.hole_cards = hc
+            
+            # Determine Status (Priority: hole_cards > sitting_out > folded > has_cards)
+            # If hole cards are detected, player is ALWAYS active
+            if player.hole_cards:
+                player.status = "ACTIVE"
+                active_indices.append(idx)
+            elif p_data.get("is_sitting_out", False):
+                player.status = "SITTING_OUT"
+            elif p_data.get("is_folded", False):
+                player.status = "FOLDED"
+            elif p_data.get("has_cards", False):
+                player.status = "ACTIVE"
+                active_indices.append(idx)
+            else:
+                player.status = "FOLDED"  # No cards and not sitting out = folded
+            
+            # Track dealer
+            if player.is_dealer:
+                snapshot.dealer_seat_index = idx
+                
+            temp_players.append(player)
+        
+        # Pass 2: Assign position labels (skip sitting-out players)
+        # First, get list of seat indices for non-sitting-out players
+        active_seats = [p.seat_index for p in temp_players if p.status != "SITTING_OUT"]
+        
+        for player in temp_players:
+            if player.status == "SITTING_OUT":
+                player.name = "OUT"
+            else:
+                # Calculate position among only active seats
+                player.name = get_position_label_dynamic(
+                    player.seat_index, 
+                    snapshot.dealer_seat_index, 
+                    active_seats
+                )
+            snapshot.players.append(player)
+            
+        # 3. Post-Process Logic (The "Logic Layer")
+        highest_bet = 0.0
+        aggressor = -1
+        
+        for p in snapshot.players:
+            if p.current_bet > highest_bet:
+                highest_bet = p.current_bet
+                aggressor = p.seat_index
+        
+        # Default deduction
+        snapshot.last_action_context.amount_to_call = highest_bet
+        snapshot.last_action_context.aggressor_seat_index = aggressor
+        
+        # 4. Hero Context (Override from Buttons)
+        # FORCE HERO TURN as requested by user
+        snapshot.action_on_seat_index = 4 # Hero is Seat 5 (idx 4)
+        h_ctx = data.get("hero_context", {})
+        # if h_ctx.get("is_turn"):
+        #     snapshot.action_on_seat_index = 4 # Hero is Seat 5 (idx 4)
+        
+        # If call amount is explicitly seen on buttons, trust it over deduction
+        call_amt = h_ctx.get("amount_to_call_bb")
+        if call_amt is not None and call_amt > 0:
+             snapshot.last_action_context.amount_to_call = float(call_amt)
+        
+        # Update Meta (Blind Levels hardcoded for now or parsed?)
+        snapshot.meta_info.blind_level = {"sb": 0.01, "bb": 0.02, "ante": 0}
+
+    except json.JSONDecodeError:
+        console.print("[red]Failed to parse JSON response[/red]")
+    except Exception as e:
+        console.print(f"[red]Error parsing snapshot: {e}[/red]")
+        
+    return snapshot
+
+
+
+
+
+
+
+def show_preflop_chart(position: str = None):
+    """Display preflop range chart."""
+    data = load_data()
+    ranges = data.get("ranges", {}).get("6max", {})
     
-    return Panel(output, title="[bold blue]♠ Poker Range Assistant ♠[/bold blue]", border_style="blue")
+    if position and position.upper() in ranges:
+        pos = position.upper()
+        r = ranges[pos]
+        console.print(f"\n[bold cyan]═══ {pos} Preflop Ranges ═══[/bold cyan]")
+        console.print(f"[green]Open:[/green] {r.get('open', 'N/A')}")
+        if 'vs_3bet' in r:
+            console.print(f"[yellow]vs 3bet:[/yellow] {r.get('vs_3bet', 'N/A')}")
+        if 'defend_vs_open' in r:
+            console.print(f"[yellow]Defend:[/yellow] {r.get('defend_vs_open', 'N/A')}")
+        if '3bet' in r:
+            console.print(f"[magenta]3bet:[/magenta] {r.get('3bet', 'N/A')}")
+        console.print(f"[dim]{r.get('description', '')}[/dim]")
+    else:
+        # Show all positions
+        console.print("\n[bold cyan]═══ 6-Max Preflop Ranges ═══[/bold cyan]")
+        table = Table(show_header=True, header_style="bold")
+        table.add_column("Position")
+        table.add_column("Open Range")
+        table.add_column("Description")
+        
+        for pos in ["UTG", "MP", "CO", "BTN", "SB", "BB"]:
+            if pos in ranges:
+                r = ranges[pos]
+                open_range = r.get('open', r.get('defend_vs_open', 'N/A'))[:50] + "..."
+                table.add_row(pos, open_range, r.get('description', ''))
+        
+        console.print(table)
+    console.print("[dim]Press 'p' + position (e.g., 'pCO') for details[/dim]\n")
+
+
+def show_player_notes():
+    """Display all saved player notes."""
+    data = load_data()
+    notes = data.get("notes", {})
+    
+    if not notes:
+        console.print("\n[yellow]No player notes saved yet.[/yellow]")
+        console.print("[dim]Press 'n' to add a note[/dim]\n")
+        return
+    
+    console.print("\n[bold cyan]═══ Player Notes ═══[/bold cyan]")
+    for player, note_list in notes.items():
+        console.print(f"[bold white]{player}:[/bold white]")
+        for note in note_list[-5:]:  # Show last 5 notes
+            console.print(f"  • {note}")
+    console.print()
+
+
+def add_player_note(player: str, note: str):
+    """Add a note for a player."""
+    data = load_data()
+    if "notes" not in data:
+        data["notes"] = {}
+    if player not in data["notes"]:
+        data["notes"][player] = []
+    data["notes"][player].append(note)
+    save_data(data)
+    console.print(f"[green]✓ Note added for {player}[/green]")
+
+
+def get_player_notes(players: list) -> str:
+    """Get notes for active players."""
+    data = load_data()
+    notes = data.get("notes", {})
+    
+    found = []
+    for player in players:
+        if player in notes and notes[player]:
+            # Get last note
+            found.append(f"{player}: {notes[player][-1]}")
+    
+    return " | ".join(found) if found else ""
+
+
+# Global state
+monitor_num = 1
+running = True
+last_state = None
+input_mode = None
+note_player = ""
+
+
+
+class GameRecorder:
+    def __init__(self):
+        self.filename = f"session_{int(time.time())}.jsonl" # JSON Lines formatted
+        self.log(f"Session Started: {self.filename}", is_meta=True)
+    
+    def log(self, content, is_meta=False):
+        with open(self.filename, "a", encoding="utf-8") as f:
+            if is_meta:
+                f.write(json.dumps({"meta": content}) + "\n")
+            else:
+                f.write(json.dumps(content) + "\n")
+
+    def update(self, snapshot: GameSnapshot):
+        # Simply log the full snapshot
+        # Convert to dict first
+        data = dataclasses.asdict(snapshot)
+        self.log(data)
+        # (This is done in log)
+
+
+
+def analyze_state(monitor: int) -> tuple[GameSnapshot, dict, float, float]:
+    """
+    1. Capture Regions
+    2. Vision API -> GameSnapshot
+    """
+    t0 = time.time()
+    
+    # 1. Capture Direct Regions
+    comps = capture_regions()
+    t_capture = time.time() - t0
+    
+    # save_debug_images(comps) # Disabled
+    
+    # 2. Vision Pass 
+    t1 = time.time()
+    
+    # Prepare images for Gemini
+    # Images 1-6: Seats 1-6.
+    # Image 7: Board.
+    # Image 8: Pot Info (Reuse board image).
+    
+    seat_imgs = [
+        comps["seat1"], comps["seat2"], comps["seat3"], 
+        comps["seat4"], comps["hero"],  comps["seat6"]
+    ]
+    
+    vision_input = [ANALYZE_PROMPT] + seat_imgs + [comps["board"], comps["buttons"]] 
+    
+    try:
+        response = vision_model.generate_content(vision_input)
+        # Save raw response for debugging
+        with open("debug_vision_response.txt", "w") as f:
+            f.write(response.text)
+        console.print(f"[dim]Vision response saved to debug_vision_response.txt[/dim]")
+        snapshot = parse_response(response.text)
+        console.print(f"[dim]Parsed {len(snapshot.players)} players[/dim]")
+    except Exception as e:
+        console.print(f"[red]Vision Error: {e}[/red]")
+        snapshot = GameSnapshot() 
+        
+    t_vision = time.time() - t1
+    
+    return snapshot, comps, t_capture, t_vision
+
+
+def analyze_and_display(monitor: int):
+    """Main function for single-shot analysis (Hotkey J)."""
+    global last_state, live_mode, live_builder
+    
+    start_total = time.time()
+    console.print("\n[dim]Analyzing (Full 6-Max Grid)...[/dim]")
+    
+    # MODE A: LIVE DATA (Strategy on existing history)
+    if live_mode and live_builder:
+        # Use simple Live Logic for now until fully refactored
+        console.print("[dim]Using Live Data...[/dim]")
+        state = live_state
+        if not state: 
+            return
+    else:
+        # MODE B: SNAPSHOT
+        try:
+            state, comps, t_capture, t_vision = analyze_state(monitor)
+            last_state = state
+            
+            hero = next((p for p in state.players if p.is_hero), None)
+            if not hero or not hero.hole_cards:
+                 console.print("[yellow]No hand detected.[/yellow]")
+            else:
+                # Strategy logic needs update to accept GameSnapshot?
+                # For now pass the whole snapshot to a prompt builder?
+                # or just display.
+                # Let's keep Strategy simple for a moment.
+                pass
+                
+            t_total = time.time() - start_total
+            display_results(state, "", t_capture, t_vision, 0, t_total)
+            
+        except Exception as e:
+            console.print(f"[red]Error: {e}[/red]")
+
+
+def display_results(snapshot: GameSnapshot, analysis: str, t_cap, t_vis, t_strat, t_tot):
+    """Comprehensive display of GameSnapshot data."""
+    console.clear()
+    
+    # Header
+    console.print(f"\n[bold green]♠ POKER VISION SNAPSHOT ♠[/bold green]")
+    console.print(f"[dim]ID: {snapshot.hand_id} | Timestamp: {snapshot.timestamp}[/dim]")
+    console.print(f"⏱️  Capture: {t_cap:.2f}s | Vision: {t_vis:.2f}s | Strategy: {t_strat:.2f}s | Total: {t_tot:.2f}s\n")
+    
+    # ----- GAME STATE -----
+    street = snapshot.meta_info.current_street
+    board_str = " ".join(snapshot.board_state.community_cards) or "—"
+    pot = snapshot.board_state.total_pot
+    dealer_idx = snapshot.dealer_seat_index
+    
+    console.print(f"[bold cyan]═══ GAME STATE ═══[/bold cyan]")
+    console.print(f"  Street:       [bold blue]{street}[/bold blue]")
+    console.print(f"  Board:        [white]{board_str}[/white]")
+    console.print(f"  Total Pot:    [yellow]{pot} BB[/yellow]")
+    console.print(f"  Dealer Seat:  [magenta]Seat {dealer_idx + 1}[/magenta]")
+    console.print(f"  Action On:    [green]Seat {snapshot.action_on_seat_index + 1}[/green]")
+    console.print()
+    
+    # ----- HERO CONTEXT -----
+    ctx = snapshot.last_action_context
+    console.print(f"[bold cyan]═══ HERO CONTEXT ═══[/bold cyan]")
+    console.print(f"  Amount to Call: [yellow]{ctx.amount_to_call} BB[/yellow]")
+    
+    # Find aggressor info
+    if ctx.aggressor_seat_index >= 0:
+        aggressor = next((p for p in snapshot.players if p.seat_index == ctx.aggressor_seat_index), None)
+        if aggressor:
+            console.print(f"  Aggressor:      [red]{aggressor.name} (Seat {ctx.aggressor_seat_index + 1}) bet {aggressor.current_bet} BB[/red]")
+        else:
+            console.print(f"  Aggressor:      [red]Seat {ctx.aggressor_seat_index + 1}[/red]")
+    else:
+        console.print(f"  Aggressor:      [dim]None (checked around)[/dim]")
+    console.print()
+    
+    # ----- PLAYER TABLE -----
+    console.print(f"[bold cyan]═══ PLAYERS ═══[/bold cyan]")
+    
+    table = Table(show_header=True, header_style="bold white", box=None)
+    table.add_column("Seat", style="cyan", width=5)
+    table.add_column("Position", style="magenta", width=8)
+    table.add_column("Stack (BB)", justify="right", width=10)
+    table.add_column("Bet (BB)", justify="right", width=8)
+    table.add_column("Status", width=12)
+    table.add_column("Cards", width=10)
+    table.add_column("Role", width=10)
+    
+    for p in sorted(snapshot.players, key=lambda x: x.seat_index):
+        seat_num = p.seat_index + 1
+        pos = p.name or f"P{seat_num}"
+        stack = f"{p.stack_size:.1f}"
+        bet = f"{p.current_bet:.1f}" if p.current_bet > 0 else "—"
+        
+        # Status coloring
+        if p.status == "ACTIVE":
+            status = "[green]ACTIVE[/green]"
+        elif p.status == "FOLDED":
+            status = "[dim]FOLDED[/dim]"
+        elif p.status == "ALL_IN":
+            status = "[red]ALL-IN[/red]"
+        else:
+            status = f"[dim]{p.status}[/dim]"
+        
+        # Cards
+        cards = " ".join(p.hole_cards) if p.hole_cards else "—"
+        
+        # Role
+        roles = []
+        if p.is_hero:
+            roles.append("[yellow]HERO[/yellow]")
+        if p.is_dealer:
+            roles.append("[magenta]BTN[/magenta]")
+        role_str = " ".join(roles) if roles else "—"
+        
+        table.add_row(str(seat_num), pos, stack, bet, status, cards, role_str)
+    
+    console.print(table)
+    console.print()
+    
+    # ----- STRATEGY OUTPUT (if any) -----
+    if analysis:
+        console.print(f"[bold cyan]═══ STRATEGY ADVICE ═══[/bold cyan]")
+        for line in analysis.split('\n'):
+            line = line.strip()
+            if line:
+                console.print(f"  {line}")
+        console.print()
+    
+    console.print(f"[bold cyan]════════════════════════════════════════[/bold cyan]")
+
+
+
+
+
+
+
+
+
+# Global state
+monitor_num = 1
+running = True
+last_state = None
+input_mode = None
+note_player = ""
+current_history = HandHistory()  # Accumulates snapshots for current hand
+
+
+def run_analysis_flow(mode: str = "debug"):
+    """
+    Main Logic Flow:
+    1. debug -> Capture + Vision + Accumulate History + Display Table
+    2. strategy -> Use accumulated history for strategy advice
+    """
+    global last_state, current_history
+    
+    start_total = time.time()
+    
+    if mode == "debug":
+        console.print("\n[dim]📸 SNAPSHOT (Vision Check)...[/dim]")
+    else:
+        console.print("\n[dim]🧠 STRATEGY (Thinking)...[/dim]")
+    
+    try:
+        # 1. Capture & Vision
+        snapshot, comps, t_capture, t_vision = analyze_state(monitor_num)
+        last_state = snapshot
+        
+        # 2. Hand History - Always add snapshot (user presses 'n' for new hand)
+        current_history.add_snapshot(snapshot)
+        console.print(f"[dim]📝 Turn {len(current_history.snapshots)} added to history[/dim]")
+        
+        analysis = ""
+        t_strategy = 0.0
+        
+        # 3. Strategy (Optional) - Uses FULL HISTORY
+        if mode == "strategy":
+            hero = next((p for p in snapshot.players if p.is_hero), None)
+            
+            if not hero or not hero.hole_cards:
+                analysis = "No Hero Hand Detected."
+            else:
+                t2 = time.time()
+                
+                # Build strategy prompt with FULL HISTORY
+                history_json = current_history.to_json()
+                strategy_prompt = f"""
+                You are a professional poker strategist. Analyze this hand history and recommend the best action.
+                
+                FULL HAND HISTORY (all turns so far):
+                {history_json}
+                
+                CURRENT SITUATION:
+                - Street: {snapshot.meta_info.current_street}
+                - Board: {" ".join(snapshot.board_state.community_cards)}
+                - Hero Cards: {" ".join(hero.hole_cards)}
+                - Pot: {snapshot.board_state.total_pot} BB
+                - Amount to Call: {snapshot.last_action_context.amount_to_call} BB
+                
+                Provide:
+                1. What happened so far (summarize the action)
+                2. Opponent range analysis
+                3. Hero's equity estimate
+                4. RECOMMENDED ACTION with sizing
+                
+                Be concise but thorough.
+                """
+                
+                try:
+                    resp = strategy_model.generate_content(strategy_prompt)
+                    analysis = resp.text.strip()
+                except Exception as e:
+                    analysis = f"Strategy Error: {e}"
+                t_strategy = time.time() - t2
+
+        t_total = time.time() - start_total
+        
+        # 4. Display
+        display_results(snapshot, analysis, t_capture, t_vision, t_strategy, t_total)
+        
+        # Show history summary
+        console.print(f"\n[dim]{current_history.summary()}[/dim]")
+        
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+
+
+
+def on_press(key):
+    global running, input_mode, note_player
+    try:
+        if hasattr(key, 'char') and key.char:
+            char = key.char.lower()
+            
+            if char == 'j':
+                # J = Strategy Mode
+                run_analysis_flow(mode="strategy")
+                
+            elif char == 'l':
+                # L = Debug Snapshot (Vision Check)
+                run_analysis_flow(mode="debug")
+                    
+            elif char == 'p':
+                # Show preflop chart for last detected position
+                pos = None
+                if last_state:
+                     hero = next((p for p in last_state.players if p.is_hero), None)
+                     pos = hero.name if hero else None
+                show_preflop_chart(pos)
+            elif char == 'n':
+                # Reset hand history (NEW HAND)
+                current_history.reset()
+                console.print("\n[bold green]🆕 HAND HISTORY RESET - Ready for new hand![/bold green]")
+            elif char == 'q':
+                running = False
+                return False
+                
+        elif key == keyboard.Key.esc:
+            running = False
+            return False
+    except AttributeError:
+        pass
 
 
 def main():
-    """Main loop - capture and analyze poker table."""
-    console.print(Panel.fit(
-        "[bold green]Poker Range Assistant[/bold green]\n"
-        "Analyzing PokerStars tables in real-time\n"
-        "[dim]Press Ctrl+C to exit[/dim]",
-        border_style="green"
-    ))
+    global monitor_num
     
-    # Check for monitor selection
-    with mss.mss() as sct:
-        monitors = sct.monitors
-        console.print(f"\n[cyan]Found {len(monitors) - 1} monitor(s)[/cyan]")
-        for i, m in enumerate(monitors[1:], 1):
-            console.print(f"  Monitor {i}: {m['width']}x{m['height']}")
-    
-    monitor_num = 1
+    # Parse monitor arg
     if len(sys.argv) > 1:
         try:
             monitor_num = int(sys.argv[1])
         except ValueError:
             pass
     
-    console.print(f"\n[yellow]Watching monitor {monitor_num}. Pass monitor number as argument to change.[/yellow]")
-    console.print("[dim]Starting in 3 seconds...[/dim]\n")
-    time.sleep(3)
+    # Show monitors
+    with mss.mss() as sct:
+        console.print(f"[cyan]Monitors: {len(sct.monitors) - 1}[/cyan]")
+        for i, m in enumerate(sct.monitors[1:], 1):
+            console.print(f"  {i}: {m['width']}x{m['height']}")
     
-    last_state = None
-    poll_interval = 1.5  # seconds
+    console.print(f"\n[bold green]♠ Poker Range Assistant ♠[/bold green]")
+    console.print(f"[white]Monitor: {monitor_num}[/white]")
+    console.print(f"[yellow]'l' SNAPSHOT | 'j' STRATEGY | 'n' NEW HAND | 'p' CHART | ESC quit[/yellow]\n")
     
-    try:
-        while True:
-            # Capture screen
-            img = capture_screen(monitor_num)
-            
-            # Analyze with Gemini
-            console.print("[dim]Analyzing...[/dim]", end="\r")
-            state = analyze_table(img)
-            
-            if state and state.hero_cards and state.hero_cards != "unknown":
-                # Get range estimates
-                ranges = estimate_ranges(state)
-                
-                # Calculate equity
-                equity = calculate_simple_equity(
-                    state.hero_cards,
-                    ranges,
-                    state.board
-                )
-                
-                # Display
-                console.clear()
-                console.print(create_display(state, ranges, equity))
-                
-                last_state = state
-            else:
-                if last_state:
-                    console.print("[dim]No active hand detected, showing last state...[/dim]")
-                else:
-                    console.print("[yellow]Waiting for poker table... Make sure PokerStars is visible.[/yellow]", end="\r")
-            
-            time.sleep(poll_interval)
-            
-    except KeyboardInterrupt:
-        console.print("\n[green]Exiting Poker Range Assistant. Good luck at the tables! 🍀[/green]")
+    # Start keyboard listener
+    with keyboard.Listener(on_press=on_press) as listener:
+        listener.join()
+    
+    console.print("\n[green]Good luck at the tables! 🍀[/green]")
 
 
 if __name__ == "__main__":
     main()
+
