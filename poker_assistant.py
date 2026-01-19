@@ -929,16 +929,22 @@ def run_analysis_flow(mode: str = "debug"):
                     # Risk / (Reward + Risk)
                     pot_odds_pct = (call_amount / (final_pot + call_amount)) * 100
                     pot_odds_ratio = f"{(final_pot / call_amount):.1f}:1"
+                    pot_odds_str = f"{pot_odds_pct:.1f}% ({pot_odds_ratio})"
                 else:
                     pot_odds_pct = 0.0
                     pot_odds_ratio = "N/A"
+                    pot_odds_str = "N/A (Facing 0 bet)"
                 
+                # Store metrics for display
                 metrics = {
                     "eff_stack": eff_stack,
                     "spr": spr,
                     "pot_odds_pct": pot_odds_pct,
                     "pot_odds_ratio": pot_odds_ratio
                 }
+
+                # Define current action for the prompt
+                current_action = f"Facing bet/raise of {call_amount} BB" if call_amount > 0 else "Checked to Hero"
 
                 # Build strategy prompt with FULL HISTORY
                 history_json = current_history.to_json()
@@ -954,11 +960,13 @@ def run_analysis_flow(mode: str = "debug"):
                 - Position: {hero.name}
                 - Pot: {final_pot:.2f} BB
                 - Call: {call_amount} BB
+                - Action: {current_action}
+                - Villain Profile: Unknown/Random
                 
                 MATH & METRICS (Calculated):
                 - Effective Stack: {eff_stack:.1f} BB
                 - SPR: {spr:.2f}
-                - Pot Odds: {pot_odds_pct:.1f}% ({pot_odds_ratio})
+                - Pot Odds: {pot_odds_str}
                 
                 OUTPUT FORMAT (STRICT):
                 Line 1: RECOMMENDATION: [ACTION] [SIZING] (e.g. "RECOMMENDATION: FOLD")
