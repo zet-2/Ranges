@@ -184,7 +184,8 @@ Role: You are a Poker Vision Expert. Analyze the provided poker table images to 
 
 INPUT CONTEXT:
 - You are analyzing individual seat crops (Images 1-6), the Board (Image 7), and Actions (Image 8).
-- The visual style is PokerStars "Carbon" or similar dark theme.
+- The visual style is PokerStars "Carbon" (4-Color Deck).
+- **COLOR KEY:** Gray/Black = Spades (s), Blue = Diamonds (d), Red = Hearts (h), Green = Clubs (c).
 
 VISUAL ANALYSIS INSTRUCTIONS (STRICT HIERARCHY):
 
@@ -401,9 +402,9 @@ def parse_response(text: str) -> GameSnapshot:
         data = json.loads(cleaned_text.strip())
         
         # 1. Parse Board & Meta
-        board_cards = data.get("board_cards", [])
+        board_cards = data.get("board_cards") or data.get("board") or []
         snapshot.board_state.community_cards = board_cards
-        snapshot.board_state.total_pot = float(data.get("total_pot_bb") or 0)
+        snapshot.board_state.total_pot = float(data.get("total_pot_bb") or data.get("pot") or 0)
         
         # Deduce Street
         bc_len = len(board_cards)
@@ -413,24 +414,38 @@ def parse_response(text: str) -> GameSnapshot:
         elif bc_len == 5: snapshot.meta_info.current_street = "RIVER"
         
         # 2. Parse Players (Two-Pass for correct position labels)
-        seats_data = data.get("seats", [])
+        seats_data = data.get("seats") or data.get("players") or []
         active_indices = []
         temp_players = []
         
         # Pass 1: Create players and find dealer
         for p_data in seats_data:
-            idx = p_data.get("seat_index", 0)
-            
+            # Handle seat index variations
+            if "seat_index" in p_data:
+                idx = p_data["seat_index"]
+            elif "seat" in p_data:
+                idx = p_data["seat"] - 1 # Convert 1-based to 0-based
+            else:
+                idx = 0
+
             player = Player(seat_index=idx)
-            player.stack_size = float(p_data.get("stack_size_bb") or 0)
-            player.current_bet = float(p_data.get("current_bet_bb") or 0)
+            
+            # Handle stack variations
+            stack_val = p_data.get("stack_size_bb") or p_data.get("stack") or 0
+            if isinstance(stack_val, str):
+                # Clean string currency if needed (simple removal)
+                stack_val = stack_val.replace('$','').replace('€','').strip()
+            player.stack_size = float(stack_val)
+            
+            player.current_bet = float(p_data.get("current_bet_bb") or p_data.get("bet") or 0)
             player.is_hero = (idx == 4) # Assuming Seat 5 (Index 4) is Hero
-            player.is_dealer = p_data.get("is_dealer", False)
+            player.is_dealer = p_data.get("is_dealer") or p_data.get("dealer") or False
             
             # Hole Cards (Hero Only) - Check FIRST
-            hc = p_data.get("hole_cards")
+            hc = p_data.get("hole_cards") or p_data.get("cards")
             if player.is_hero and hc and isinstance(hc, list):
-                player.hole_cards = hc
+                # Filter out "XX" placeholders if specific to hallucination
+                player.hole_cards = [c for c in hc if c and c.upper() != "XX"]
             
             # Determine Status (Priority: hole_cards > sitting_out > folded > has_cards)
             # If hole cards are detected, player is ALWAYS active
@@ -441,7 +456,7 @@ def parse_response(text: str) -> GameSnapshot:
                 player.status = "SITTING_OUT"
             elif p_data.get("is_folded", False):
                 player.status = "FOLDED"
-            elif p_data.get("has_cards", False):
+            elif p_data.get("has_cards", False) or (hc and "XX" in str(hc)): # Fallback for XX cards
                 player.status = "ACTIVE"
                 active_indices.append(idx)
             else:
@@ -701,7 +716,7 @@ def analyze_and_display(monitor: int):
             console.print(f"[red]Error: {e}[/red]")
 
 
-def display_results(snapshot: GameSnapshot, analysis: str, t_cap, t_vis, t_strat, t_tot):
+def display_results(snapshot: GameSnapshot, analysis: str, t_cap, t_vis, t_strat, t_tot, metrics: dict = None):
     """Comprehensive display of GameSnapshot data."""
     console.clear()
     
@@ -756,6 +771,22 @@ def display_results(snapshot: GameSnapshot, analysis: str, t_cap, t_vis, t_strat
         f"[bold cyan]BOARD ({snapshot.meta_info.current_street})[/bold cyan]\n[bold white]{board_str}[/bold white]",
         f"[bold cyan]POT[/bold cyan]\n[bold yellow]{pot}[/bold yellow]"
     )
+    
+    # Metrics Row
+    if metrics:
+        spr = metrics.get("spr", 0)
+        odds_pct = metrics.get("pot_odds_pct", 0)
+        odds_ratio = metrics.get("pot_odds_ratio", "N/A")
+        eff = metrics.get("eff_stack", 0)
+        
+        spr_color = "green" if spr > 10 else "yellow" if spr > 3 else "red"
+        
+        grid.add_row(
+            f"[dim]Eff Stack:[/dim] [white]{eff:.1f} BB[/white]",
+            f"[dim]SPR:[/dim] [{spr_color}]{spr:.2f}[/{spr_color}]",
+            f"[dim]Odds:[/dim] [cyan]{odds_pct:.1f}% ({odds_ratio})[/cyan]"
+        )
+
     console.print(grid)
     console.print()
 
@@ -831,6 +862,19 @@ def run_analysis_flow(mode: str = "debug"):
     try:
         # 1. Capture & Vision
         snapshot, comps, t_capture, t_vision = analyze_state(monitor_num)
+        
+        # --- BOARD PERSISTENCE (Anti-Hallucination) ---
+        if len(current_history.snapshots) > 0:
+            prev_snapshot = current_history.snapshots[-1]
+            prev_board = prev_snapshot.board_state.community_cards
+            curr_board = snapshot.board_state.community_cards
+            
+            # If we have cards from previous turns, they shouldn't change
+            if len(curr_board) >= len(prev_board) and len(prev_board) > 0:
+                # Keep the old cards as they were, only take the NEW cards from the current vision
+                new_cards = curr_board[len(prev_board):]
+                snapshot.board_state.community_cards = prev_board + new_cards
+
         last_state = snapshot
         
         # 2. Hand History - Always add snapshot (user presses 'n' for new hand)
@@ -840,6 +884,7 @@ def run_analysis_flow(mode: str = "debug"):
         
         analysis = ""
         t_strategy = 0.0
+        metrics = None
         
         # 3. Strategy (Optional) - Uses FULL HISTORY
         if mode == "strategy":
@@ -866,7 +911,6 @@ def run_analysis_flow(mode: str = "debug"):
                     max_seen_pot = snapshot.board_state.total_pot
                 
                 # Calculate Effective Pot (Center + Active Bets)
-                # Vision 'Pot' text area is usually separate from player 'Bet' bubbles.
                 current_bets = sum(p.current_bet for p in snapshot.players)
                 final_pot = max_seen_pot + current_bets
                 
@@ -888,6 +932,13 @@ def run_analysis_flow(mode: str = "debug"):
                 else:
                     pot_odds_pct = 0.0
                     pot_odds_ratio = "N/A"
+                
+                metrics = {
+                    "eff_stack": eff_stack,
+                    "spr": spr,
+                    "pot_odds_pct": pot_odds_pct,
+                    "pot_odds_ratio": pot_odds_ratio
+                }
 
                 # Build strategy prompt with FULL HISTORY
                 history_json = current_history.to_json()
@@ -932,7 +983,7 @@ def run_analysis_flow(mode: str = "debug"):
         t_total = time.time() - start_total
         
         # 4. Display
-        display_results(snapshot, analysis, t_capture, t_vision, t_strategy, t_total)
+        display_results(snapshot, analysis, t_capture, t_vision, t_strategy, t_total, metrics)
         
         # Show history summary
         # console.print(f"\n[dim]{current_history.summary()}[/dim]")
