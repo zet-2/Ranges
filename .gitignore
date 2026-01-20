@@ -135,5 +135,6 @@ dmypy.json
 .env
 
 session_*.jsonl
-
-
+debug_*.txt
+villain_stats.json
+poker_data.json
