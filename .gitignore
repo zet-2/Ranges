@@ -125,6 +125,7 @@ dmypy.json
 # IDE
 .vscode/
 .idea/
+.DS_Store
 *.swp
 *.swo
 *~
@@ -137,4 +138,3 @@ dmypy.json
 session_*.jsonl
 debug_*.txt
 villain_stats.json
-poker_data.json
