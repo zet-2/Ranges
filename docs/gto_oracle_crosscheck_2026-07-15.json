@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "board": ["2s", "3h", "4d", "6c", "7c"],
+  "starting_pot_units": 20,
+  "effective_stack_units": 10,
+  "oop_range": ["AsAh", "QsQh"],
+  "ip_range": ["KsKh"],
+  "actions": ["CHECK", "ALL_IN_TO_10"],
+  "max_raises": 0,
+  "rake": 0,
+  "iterations": 1000000,
+  "solvers": {
+    "brown_reference": {
+      "repository": "https://github.com/noambrown/poker_solver",
+      "exploitability_units": 0.000001,
+      "qq_bet_frequency": 0.3333332554,
+      "aa_bet_frequency": 1.0,
+      "kk_call_vs_bet_frequency": 0.6666669318,
+      "centered_oop_root_ev_units": 3.3333333333
+    },
+    "pinned_oracle": {
+      "repository": "https://github.com/b-inary/postflop-solver",
+      "commit": "9d1509fe5077d019825f833eed04b16d342dfda1",
+      "exploitability_units": 0.000008583,
+      "qq_bet_frequency": 0.333331704,
+      "aa_bet_frequency": 1.0,
+      "kk_call_vs_bet_frequency": 0.666666627,
+      "centered_oop_root_ev_units": 3.333333
+    }
+  },
+  "absolute_deltas": {
+    "qq_bet_frequency": 0.0000015514,
+    "aa_bet_frequency": 0.0,
+    "kk_call_vs_bet_frequency": 0.0000003048,
+    "centered_oop_root_ev_units": 0.0000003333,
+    "max_per_root_action_ev_units": 0.000009861
+  },
+  "note": "An unreachable-node policy difference was excluded because Nash behavior is non-unique at zero-reach nodes."
+}

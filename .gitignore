@@ -132,9 +132,13 @@ dmypy.json
 
 /debug_images
 /biba287
+/benchmark_data/
+/benchmark_results/
 
 .env
 
 session_*.jsonl
 debug_*.txt
 villain_stats.json
+gto_live_cache.sqlite3*
+/preflop_blueprint_cache/

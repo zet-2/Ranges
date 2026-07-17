@@ -1,0 +1,109 @@
+{
+  "schema_version": 1,
+  "measured_at": "2026-07-15",
+  "host": {
+    "architecture": "arm64",
+    "os": "macOS 26.3 (25D125)",
+    "rustc": "1.97.0"
+  },
+  "engine": {
+    "repository": "https://github.com/b-inary/postflop-solver",
+    "commit": "9d1509fe5077d019825f833eed04b16d342dfda1",
+    "build": "release, 32-bit storage, rayon, bincode disabled"
+  },
+  "spot": {
+    "board": ["Td", "9d", "6h", "Qc", "2s"],
+    "starting_pot_units": 100,
+    "effective_stack_units": 400,
+    "oop_range": "66+,A8s+,A5s-A4s,AJo+,K9s+,KQo,QTs+,JTs,96s+,85s+,75s+,65s,54s",
+    "ip_range": "QQ-22,AQs-A2s,ATo+,K5s+,KJo+,Q8s+,J8s+,T7s+,96s+,86s+,75s+,64s+,53s+",
+    "oop_hands_river": 167,
+    "ip_hands_river": 246,
+    "oop_hands_flop": 180,
+    "ip_hands_flop": 265,
+    "raise_sizes": "2.5x"
+  },
+  "runs": [
+    {
+      "street": "RIVER",
+      "bet_sizes": "50%",
+      "target_exploitability_pct": 0.5,
+      "solve_seconds": 0.0020,
+      "iterations": 30,
+      "exploitability_units": 0.432666,
+      "estimated_memory_mib": 0.18
+    },
+    {
+      "street": "TURN",
+      "bet_sizes": "50%",
+      "target_exploitability_pct": 0.5,
+      "solve_seconds": 0.0457,
+      "iterations": 50,
+      "exploitability_units": 0.483908,
+      "estimated_memory_mib": 5.62
+    },
+    {
+      "street": "FLOP",
+      "bet_sizes": "50%",
+      "target_exploitability_pct": 0.5,
+      "solve_seconds": 3.2401,
+      "iterations": 60,
+      "exploitability_units": 0.496781,
+      "estimated_memory_mib": 380.70
+    },
+    {
+      "street": "RIVER",
+      "bet_sizes": "33%, 75%",
+      "target_exploitability_pct": 0.5,
+      "solve_seconds": 0.0094,
+      "iterations": 60,
+      "exploitability_units": 0.417431,
+      "estimated_memory_mib": 0.24
+    },
+    {
+      "street": "TURN",
+      "bet_sizes": "33%, 75%",
+      "target_exploitability_pct": 0.5,
+      "solve_seconds": 0.3059,
+      "iterations": 90,
+      "exploitability_units": 0.485606,
+      "estimated_memory_mib": 25.97
+    },
+    {
+      "street": "FLOP",
+      "bet_sizes": "33%, 75%",
+      "target_exploitability_pct": 0.5,
+      "solve_seconds": 51.7542,
+      "iterations": 140,
+      "exploitability_units": 0.468710,
+      "estimated_memory_mib": 2686.87
+    },
+    {
+      "street": "RIVER",
+      "bet_sizes": "33%, 75%",
+      "target_exploitability_pct": 0.1,
+      "solve_seconds": 0.0193,
+      "iterations": 140,
+      "exploitability_units": 0.087404,
+      "estimated_memory_mib": 0.24
+    },
+    {
+      "street": "TURN",
+      "bet_sizes": "33%, 75%",
+      "target_exploitability_pct": 0.1,
+      "solve_seconds": 0.6857,
+      "iterations": 200,
+      "exploitability_units": 0.098487,
+      "estimated_memory_mib": 25.97
+    },
+    {
+      "street": "FLOP",
+      "bet_sizes": "33%, 75%",
+      "target_exploitability_pct": 0.1,
+      "solve_seconds": 145.2886,
+      "iterations": 360,
+      "exploitability_units": 0.097738,
+      "estimated_memory_mib": 2686.87
+    }
+  ]
+}

@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "id": "river-smoke-1",
+  "operation": "solve_root",
+  "offline_only_acknowledged": true,
+  "street": "RIVER",
+  "board": ["Td", "9d", "6h", "Qc", "2s"],
+  "oop_range": "AA,KK,QQ,AKs,AQs",
+  "ip_range": "JJ,TT,99,AJs,ATs,KQs",
+  "starting_pot": 100,
+  "effective_stack": 400,
+  "chip_scale": 100,
+  "chip_unit": "centi-BB",
+  "allocation_mode": "uncompressed_f32",
+  "bet_sizes": {
+    "flop": {
+      "oop": {"bet": "50%", "raise": "2.5x"},
+      "ip": {"bet": "50%", "raise": "2.5x"}
+    },
+    "turn": {
+      "oop": {"bet": "50%", "raise": "2.5x"},
+      "ip": {"bet": "50%", "raise": "2.5x"}
+    },
+    "river": {
+      "oop": {"bet": "50%", "raise": "2.5x"},
+      "ip": {"bet": "50%", "raise": "2.5x"}
+    }
+  },
+  "rake": {"rate_pct": 0.0, "cap": 0.0},
+  "tree_options": {
+    "add_allin_threshold": 1.5,
+    "force_allin_threshold": 0.15,
+    "merging_threshold": 0.1,
+    "turn_donk_sizes": null,
+    "river_donk_sizes": null
+  },
+  "target_exploitability_pct": 0.5,
+  "max_iterations": 2000
+}

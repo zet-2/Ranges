@@ -1,0 +1,96 @@
+{
+  "schema_version": 1,
+  "measured_at": "2026-07-15",
+  "purpose": "offline_post_session_model_evaluation",
+  "run_complete": true,
+  "source_artifacts": {
+    "report": {
+      "path": "benchmark_results/gto_oracle/20260715T155050302540Z_report.json",
+      "sha256": "c7228ebf26e5e4ea80720fa397bc17b0d2e834268e8224f7914b17ee97d46f3d"
+    },
+    "per_decision_results": {
+      "path": "benchmark_results/gto_oracle/20260715T155050302540Z_results.jsonl",
+      "sha256": "7af658f727bb8bedfdd6910a66e72a030cf651546614d4eeb4dcb210dcb41ab7"
+    }
+  },
+  "oracle": {
+    "repository": "https://github.com/b-inary/postflop-solver",
+    "commit": "9d1509fe5077d019825f833eed04b16d342dfda1",
+    "binary_sha256": "961a48b8b83b3db76b48e8991be2c4ad923995cb50291b9644d41dd5c41ef9be",
+    "cases": [
+      {
+        "id": "brown-river-value-bluff",
+        "street": "RIVER",
+        "private_combo_decisions": 2,
+        "target_exploitability_pct": 0.001,
+        "achieved_exploitability_pct": 0.0009757280349731445,
+        "iterations": 14080,
+        "solve_seconds": 0.009243625
+      },
+      {
+        "id": "turn-single-size-explicit-ranges",
+        "street": "TURN",
+        "private_combo_decisions": 5,
+        "target_exploitability_pct": 0.01,
+        "achieved_exploitability_pct": 0.009292125701904297,
+        "iterations": 630,
+        "solve_seconds": 0.076911333
+      },
+      {
+        "id": "river-two-size-explicit-ranges",
+        "street": "RIVER",
+        "private_combo_decisions": 22,
+        "target_exploitability_pct": 0.01,
+        "achieved_exploitability_pct": 0.0079498291015625,
+        "iterations": 520,
+        "solve_seconds": 0.004892667
+      }
+    ]
+  },
+  "evaluation": {
+    "decisions_per_model": 29,
+    "models": {
+      "claude-haiku-4-5": {
+        "coverage": 1.0,
+        "legal_action_rate": 1.0,
+        "reach_weighted_mean_ev_regret_pot_fraction": 0.015288275031783668,
+        "unweighted_mean_ev_regret_pot_fraction": 0.035156822862296266,
+        "mean_oracle_action_mass": 0.24799781266985269,
+        "uncached_latency_p50_seconds": 1.1959303750045365,
+        "uncached_latency_p95_seconds": 2.1965937909990316,
+        "input_tokens": 21248,
+        "output_tokens": 297
+      },
+      "claude-sonnet-5": {
+        "coverage": 1.0,
+        "legal_action_rate": 1.0,
+        "reach_weighted_mean_ev_regret_pot_fraction": 0.005294644946472958,
+        "unweighted_mean_ev_regret_pot_fraction": 0.011818781227901056,
+        "mean_oracle_action_mass": 0.16504058892992932,
+        "uncached_latency_p50_seconds": 2.7133222080010455,
+        "uncached_latency_p95_seconds": 4.858871499993256,
+        "input_tokens": 26614,
+        "output_tokens": 278
+      }
+    },
+    "paired": {
+      "haiku_lower_regret": 12,
+      "sonnet_lower_regret": 12,
+      "ties": 5,
+      "sonnet_to_haiku_weighted_regret_ratio": 0.3463206238418408,
+      "sonnet_weighted_regret_reduction": 0.6536793761581592
+    },
+    "diagnostic_behavior": {
+      "river_two_size_haiku": "CHECK on 21/22 combos; BET_TO 33 on 1/22",
+      "river_two_size_sonnet": "BET_TO 75 on 22/22 combos"
+    }
+  },
+  "interpretation": "Sonnet had lower aggregate EV regret on this validation set, but both models collapsed to nearly constant policies on the broader river node. This run is evidence against trusting either language model as a GTO policy and is not a representative certification corpus.",
+  "limitations": [
+    "Only 29 OOP root decisions across three heads-up postflop nodes.",
+    "No facing-bet fold/call root, preflop, six-max, or multiway solve.",
+    "Results are conditional on the supplied exact ranges, rake, stack, and discrete sizing tree.",
+    "One deterministic action was requested from each model; mixed-strategy sampling was not evaluated.",
+    "Provider latency is a small, network-dependent sample."
+  ]
+}
