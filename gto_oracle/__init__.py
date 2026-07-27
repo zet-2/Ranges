@@ -6,6 +6,16 @@ dependencies; callers must select an explicit engine execution context.
 """
 
 from .cache import OracleCache
+from .continuation import (
+    ConditionalCombo,
+    ConditionalRange,
+    ContinuationAction,
+    ContinuationDeal,
+    ContinuationResult,
+    ContinuationSpec,
+    ContinuationStep,
+    validate_continuation_result,
+)
 from .engine_client import (
     EngineClient,
     EngineClientError,
@@ -13,7 +23,9 @@ from .engine_client import (
     EngineProtocolError,
     EngineResponseError,
     EngineTimeoutError,
+    build_continuation_request,
     build_engine_request,
+    parse_continuation_response,
     parse_engine_response,
     render_weighted_range,
 )
@@ -59,6 +71,13 @@ __all__ = [
     "AssessmentStatus",
     "BetSizingConfig",
     "ComboPolicy",
+    "ConditionalCombo",
+    "ConditionalRange",
+    "ContinuationAction",
+    "ContinuationDeal",
+    "ContinuationResult",
+    "ContinuationSpec",
+    "ContinuationStep",
     "DecisionQuery",
     "EngineClient",
     "EngineClientError",
@@ -85,9 +104,12 @@ __all__ = [
     "WeightedCombo",
     "assess_action",
     "build_engine_request",
+    "build_continuation_request",
     "canonical_json",
     "sha256_key",
     "parse_engine_response",
+    "parse_continuation_response",
     "render_weighted_range",
     "validate_result_for_spec",
+    "validate_continuation_result",
 ]

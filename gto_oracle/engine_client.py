@@ -22,6 +22,14 @@ import subprocess
 import time
 from typing import Any
 
+from .continuation import (
+    ConditionalCombo,
+    ConditionalRange,
+    ContinuationAction,
+    ContinuationDeal,
+    ContinuationResult,
+    ContinuationSpec,
+)
 from .models import (
     Action,
     ActionKind,
@@ -133,7 +141,31 @@ def _run_engine_process(
             selector.register(stream, selectors.EVENT_READ, name)
         os.set_blocking(process.stdin.fileno(), False)
         if request_bytes:
-            selector.register(process.stdin, selectors.EVENT_WRITE, "stdin")
+            # Most requests fit in the pipe immediately. Write eagerly so a
+            # short-lived bridge cannot sit blocked on stdin while a platform
+            # selector delays its first writable notification. Large requests
+            # fall back to the normal non-blocking selector path.
+            try:
+                while request_offset < len(request_bytes):
+                    written = os.write(
+                        process.stdin.fileno(),
+                        request_bytes[request_offset:],
+                    )
+                    if written <= 0:
+                        break
+                    request_offset += written
+            except BlockingIOError:
+                pass
+            except BrokenPipeError:
+                close_registered(process.stdin)
+            if request_offset == len(request_bytes):
+                close_registered(process.stdin)
+            elif not process.stdin.closed:
+                selector.register(
+                    process.stdin,
+                    selectors.EVENT_WRITE,
+                    "stdin",
+                )
         else:
             process.stdin.close()
 
@@ -402,6 +434,92 @@ def build_engine_request(
     return request
 
 
+def _wire_continuation_step(
+    step: ContinuationAction | ContinuationDeal,
+) -> dict[str, object]:
+    if isinstance(step, ContinuationAction):
+        return {
+            "type": "action",
+            "action": _wire_action(step.action),
+        }
+    if isinstance(step, ContinuationDeal):
+        return {
+            "type": "deal",
+            "card": step.card,
+        }
+    raise OracleValidationError("unsupported continuation path step")
+
+
+def build_continuation_request(
+    spec: ContinuationSpec,
+    *,
+    offline_only_acknowledged: bool = True,
+    owned_simulator_acknowledged: bool = False,
+) -> dict[str, object]:
+    """Build the strict cross-street request represented by ``spec``."""
+
+    if not isinstance(spec, ContinuationSpec):
+        raise OracleValidationError(
+            "continuation engine request requires ContinuationSpec"
+        )
+    if spec.parameters.bet_sizes.flop_donk_sizes is not None:
+        raise OracleValidationError("flop donk sizes must be explicit None")
+    _validate_root_range_compatibility(spec)  # type: ignore[arg-type]
+    _execution_context(
+        offline_only_acknowledged,
+        owned_simulator_acknowledged,
+    )
+    parameters = spec.parameters
+    request: dict[str, object] = {
+        "schema_version": SCHEMA_VERSION,
+        "id": spec.cache_key,
+        "operation": "solve_path",
+        "offline_only_acknowledged": offline_only_acknowledged,
+        "chip_scale": parameters.chip_scale,
+        "chip_unit": parameters.chip_unit,
+        "street": "FLOP",
+        "board": list(spec.flop),
+        "oop_range": render_weighted_range(spec.oop_range),
+        "ip_range": render_weighted_range(spec.ip_range),
+        "starting_pot": spec.starting_pot,
+        "effective_stack": spec.effective_stack,
+        "bet_sizes": _bet_sizes_request(spec),  # type: ignore[arg-type]
+        "rake": {
+            "rate_pct": _wire_number(spec.rake_rate_pct),
+            "cap": float(spec.rake_cap),
+        },
+        "tree_options": {
+            "add_allin_threshold": _wire_number(
+                parameters.add_allin_threshold
+            ),
+            "force_allin_threshold": _wire_number(
+                parameters.force_allin_threshold
+            ),
+            "merging_threshold": _wire_number(parameters.merging_threshold),
+            "turn_donk_sizes": parameters.bet_sizes.turn_donk_sizes,
+            "river_donk_sizes": parameters.bet_sizes.river_donk_sizes,
+        },
+        "target_exploitability_pct": _wire_number(
+            parameters.target_exploitability_pct
+        ),
+        "max_iterations": parameters.max_iterations,
+        "allocation_mode": parameters.allocation_mode.value,
+        "path_history": [
+            _wire_continuation_step(step) for step in spec.path
+        ],
+        "expected_board": list(spec.current_board),
+        "expected_total_invested": list(spec.expected_total_invested),
+        "expected_current_player": spec.acting_player.value,
+        "expected_facing_bet": spec.facing_bet,
+        "expected_node_actions": [
+            _wire_action(action) for action in spec.modeled_actions
+        ],
+    }
+    if owned_simulator_acknowledged:
+        request["owned_simulator_acknowledged"] = True
+    return request
+
+
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
@@ -653,6 +771,18 @@ def _parse_action_descriptors(
     response: dict[str, Any],
     field_name: str,
 ) -> tuple[Action, ...]:
+    return _parse_expected_action_descriptors(
+        spec.tree.modeled_actions,
+        response,
+        field_name,
+    )
+
+
+def _parse_expected_action_descriptors(
+    modeled_actions: tuple[Action, ...],
+    response: dict[str, Any],
+    field_name: str,
+) -> tuple[Action, ...]:
     descriptors = _list(response[field_name], field_name)
     if not descriptors:
         raise EngineProtocolError(f"{field_name} cannot be empty")
@@ -689,9 +819,9 @@ def _parse_action_descriptors(
 
     if len(actions) != len(set(actions)):
         raise EngineProtocolError(f"{field_name} contains duplicates")
-    if set(actions) != set(spec.tree.modeled_actions):
+    if set(actions) != set(modeled_actions):
         raise EngineProtocolError(
-            f"engine {field_name} do not align with TreeConfig.modeled_actions"
+            f"engine {field_name} do not align with the modeled actions"
         )
     return tuple(actions)
 
@@ -1094,7 +1224,16 @@ def _parse_node_policies(
     return tuple(parsed), total_reachable
 
 
-def _validate_convergence(response: dict[str, Any], spec: SolveSpec) -> dict[str, Any]:
+def _starting_pot_for_spec(spec: SolveSpec | ContinuationSpec) -> int:
+    if isinstance(spec, ContinuationSpec):
+        return spec.starting_pot
+    return spec.tree.pot
+
+
+def _validate_convergence(
+    response: dict[str, Any],
+    spec: SolveSpec | ContinuationSpec,
+) -> dict[str, Any]:
     convergence = _object(response["convergence"], "convergence")
     _exact_keys(
         convergence,
@@ -1139,7 +1278,8 @@ def _validate_convergence(response: dict[str, Any], spec: SolveSpec) -> dict[str
     if min(target_units, exploitability_pct, exploitability_units) < 0:
         raise EngineProtocolError("convergence exploitability values cannot be negative")
     expected_target_units = (
-        Decimal(spec.tree.pot) * spec.parameters.target_exploitability_pct
+        Decimal(_starting_pot_for_spec(spec))
+        * spec.parameters.target_exploitability_pct
         / Decimal(100)
     )
     _require_f32_close(
@@ -1148,7 +1288,9 @@ def _validate_convergence(response: dict[str, Any], spec: SolveSpec) -> dict[str
         "convergence.target_exploitability_units",
     )
     expected_exploitability_pct = (
-        Decimal(100) * exploitability_units / Decimal(spec.tree.pot)
+        Decimal(100)
+        * exploitability_units
+        / Decimal(_starting_pot_for_spec(spec))
     )
     _require_f32_close(
         exploitability_pct,
@@ -1175,8 +1317,8 @@ def _validate_convergence(response: dict[str, Any], spec: SolveSpec) -> dict[str
 
 
 def _validate_memory_and_timings(
-    response: dict[str, Any], spec: SolveSpec
-) -> dict[str, Any]:
+    response: dict[str, Any], spec: SolveSpec | ContinuationSpec
+) -> tuple[dict[str, Any], dict[str, Any]]:
     memory = _object(response["memory"], "memory")
     _exact_keys(
         memory,
@@ -1209,7 +1351,478 @@ def _validate_memory_and_timings(
     for key in ("tree_build", "allocation", "solve", "extraction", "total"):
         if _number(timings[key], f"timings_ms.{key}") < 0:
             raise EngineProtocolError(f"timings_ms.{key} cannot be negative")
-    return timings
+    return memory, timings
+
+
+_PATH_EFFECTIVE_REQUEST_KEYS = _EFFECTIVE_REQUEST_KEYS | {
+    "path_history",
+    "expected_board",
+    "expected_total_invested",
+    "expected_current_player",
+    "expected_facing_bet",
+    "expected_node_actions",
+}
+
+
+def _validate_continuation_provenance(
+    spec: ContinuationSpec,
+    response: dict[str, Any],
+    *,
+    expected_offline_only_acknowledged: bool,
+    expected_owned_simulator_acknowledged: bool,
+) -> dict[str, Any]:
+    _execution_context(
+        expected_offline_only_acknowledged,
+        expected_owned_simulator_acknowledged,
+    )
+    provenance = _object(response["provenance"], "provenance")
+    provenance_keys = {
+        "solver",
+        "offline_only_acknowledged",
+        "effective_request",
+    }
+    if expected_owned_simulator_acknowledged:
+        provenance_keys.add("owned_simulator_acknowledged")
+    _exact_keys(provenance, provenance_keys, "provenance")
+    actual_offline = _boolean(
+        provenance["offline_only_acknowledged"],
+        "provenance.offline_only_acknowledged",
+    )
+    actual_owned = (
+        _boolean(
+            provenance["owned_simulator_acknowledged"],
+            "provenance.owned_simulator_acknowledged",
+        )
+        if "owned_simulator_acknowledged" in provenance
+        else False
+    )
+    if (
+        actual_offline != expected_offline_only_acknowledged
+        or actual_owned != expected_owned_simulator_acknowledged
+        or actual_offline == actual_owned
+    ):
+        raise EngineProtocolError(
+            "continuation execution-context provenance differs from the request"
+        )
+
+    solver = _object(provenance["solver"], "provenance.solver")
+    _exact_keys(
+        solver,
+        {
+            "name",
+            "algorithm",
+            "commit",
+            "abstraction",
+            "allocation_mode",
+            "memory_hard_limit_bytes",
+        },
+        "provenance.solver",
+    )
+    if _string(solver["name"], "provenance.solver.name") != (
+        spec.parameters.solver_name
+    ):
+        raise EngineProtocolError(
+            "continuation solver name differs from the pinned request"
+        )
+    if _string(solver["commit"], "provenance.solver.commit") != (
+        spec.parameters.solver_commit
+    ):
+        raise EngineProtocolError(
+            "continuation solver commit differs from the pinned request"
+        )
+    if _string(
+        solver["allocation_mode"],
+        "provenance.solver.allocation_mode",
+    ) != spec.parameters.allocation_mode.value:
+        raise EngineProtocolError(
+            "continuation allocation mode differs from the request"
+        )
+    _string(solver["algorithm"], "provenance.solver.algorithm")
+    _string(solver["abstraction"], "provenance.solver.abstraction")
+    _integer(
+        solver["memory_hard_limit_bytes"],
+        "provenance.solver.memory_hard_limit_bytes",
+    )
+
+    effective = _object(
+        provenance["effective_request"],
+        "provenance.effective_request",
+    )
+    _exact_keys(
+        effective,
+        _PATH_EFFECTIVE_REQUEST_KEYS,
+        "provenance.effective_request",
+    )
+    request = _roundtrip_request(
+        build_continuation_request(
+            spec,
+            offline_only_acknowledged=expected_offline_only_acknowledged,
+            owned_simulator_acknowledged=(
+                expected_owned_simulator_acknowledged
+            ),
+        )
+    )
+    expected_effective = {
+        key: request[key] for key in _PATH_EFFECTIVE_REQUEST_KEYS
+    }
+    if canonical_json(effective) != canonical_json(expected_effective):
+        raise EngineProtocolError(
+            "engine continuation provenance differs from the request"
+        )
+    return solver
+
+
+def _parse_conditional_ranges(
+    spec: ContinuationSpec,
+    response: dict[str, Any],
+) -> tuple[ConditionalRange, ConditionalRange]:
+    raw_ranges = _list(response["conditional_ranges"], "conditional_ranges")
+    if len(raw_ranges) != 2:
+        raise EngineProtocolError(
+            "conditional_ranges must contain exactly OOP and IP"
+        )
+    expected_weights = {
+        "OOP": {combo.cards: combo.weight for combo in spec.oop_range.combos},
+        "IP": {combo.cards: combo.weight for combo in spec.ip_range.combos},
+    }
+    parsed: list[ConditionalRange] = []
+    seen_players: set[str] = set()
+    range_keys = {
+        "player",
+        "total_joint_compatible_weight",
+        "combos",
+    }
+    combo_keys = {
+        "hand",
+        "input_range_weight",
+        "path_weight",
+        "joint_compatible_weight",
+        "conditional_reach_weight",
+    }
+    for range_index, raw_range in enumerate(raw_ranges):
+        field = f"conditional_ranges[{range_index}]"
+        range_data = _object(raw_range, field)
+        _exact_keys(range_data, range_keys, field)
+        player = _string(range_data["player"], f"{field}.player")
+        if player not in {"OOP", "IP"} or player in seen_players:
+            raise EngineProtocolError(
+                "conditional_ranges players must be unique OOP and IP"
+            )
+        seen_players.add(player)
+        total = _number(
+            range_data["total_joint_compatible_weight"],
+            f"{field}.total_joint_compatible_weight",
+        )
+        if total <= 0:
+            raise EngineProtocolError(
+                f"{field}.total_joint_compatible_weight must be positive"
+            )
+        combos: list[ConditionalCombo] = []
+        joint_sum = Decimal(0)
+        seen_combos: set[tuple[str, str]] = set()
+        for combo_index, raw_combo in enumerate(
+            _list(range_data["combos"], f"{field}.combos")
+        ):
+            combo_field = f"{field}.combos[{combo_index}]"
+            combo_data = _object(raw_combo, combo_field)
+            _exact_keys(combo_data, combo_keys, combo_field)
+            hand = _string(combo_data["hand"], f"{combo_field}.hand")
+            if len(hand) != 4:
+                raise EngineProtocolError(
+                    f"{combo_field}.hand must contain two cards"
+                )
+            try:
+                cards = _coerce_combo_cards(
+                    (hand[:2], hand[2:]),
+                    f"{combo_field}.hand",
+                )
+            except OracleValidationError as error:
+                raise EngineProtocolError(
+                    f"invalid {combo_field}.hand: {error}"
+                ) from error
+            if cards in seen_combos:
+                raise EngineProtocolError(
+                    f"{field}.combos contains duplicate cards"
+                )
+            seen_combos.add(cards)
+            if cards not in expected_weights[player]:
+                raise EngineProtocolError(
+                    f"{combo_field} is outside the requested {player} range"
+                )
+            input_weight = _number(
+                combo_data["input_range_weight"],
+                f"{combo_field}.input_range_weight",
+            )
+            _require_f32_close(
+                input_weight,
+                expected_weights[player][cards],
+                f"{combo_field}.input_range_weight",
+            )
+            path_weight = _number(
+                combo_data["path_weight"],
+                f"{combo_field}.path_weight",
+            )
+            joint_weight = _number(
+                combo_data["joint_compatible_weight"],
+                f"{combo_field}.joint_compatible_weight",
+            )
+            reach_weight = _number(
+                combo_data["conditional_reach_weight"],
+                f"{combo_field}.conditional_reach_weight",
+            )
+            if path_weight <= 0 or joint_weight <= 0:
+                raise EngineProtocolError(
+                    f"{combo_field} path and joint weights must be positive"
+                )
+            if path_weight > input_weight + _f32_tolerance(
+                path_weight,
+                input_weight,
+            ):
+                raise EngineProtocolError(
+                    f"{combo_field}.path_weight exceeds its input weight"
+                )
+            _require_f32_close(
+                reach_weight,
+                joint_weight / total,
+                f"{combo_field}.conditional_reach_weight",
+            )
+            try:
+                combos.append(
+                    ConditionalCombo(
+                        cards=cards,
+                        input_range_weight=input_weight,
+                        path_weight=path_weight,
+                        joint_compatible_weight=joint_weight,
+                        conditional_reach_weight=reach_weight,
+                    )
+                )
+            except OracleValidationError as error:
+                raise EngineProtocolError(
+                    f"invalid {combo_field}: {error}"
+                ) from error
+            joint_sum += joint_weight
+        if not combos:
+            raise EngineProtocolError(f"{field}.combos cannot be empty")
+        _require_f32_close(
+            joint_sum,
+            total,
+            f"{field}.total_joint_compatible_weight",
+        )
+        try:
+            parsed.append(
+                ConditionalRange(
+                    position=Position(player),
+                    combos=tuple(combos),
+                )
+            )
+        except OracleValidationError as error:
+            raise EngineProtocolError(
+                f"invalid {field}: {error}"
+            ) from error
+    if seen_players != {"OOP", "IP"}:
+        raise EngineProtocolError(
+            "conditional_ranges must contain OOP and IP"
+        )
+    return tuple(sorted(parsed, key=lambda item: item.position.value))  # type: ignore[return-value]
+
+
+def parse_continuation_response(
+    spec: ContinuationSpec,
+    payload: str,
+    *,
+    expected_id: str | None = None,
+    binary_sha256: str | None = None,
+    offline_only_acknowledged: bool = True,
+    owned_simulator_acknowledged: bool = False,
+) -> ContinuationResult:
+    """Strictly validate a ``solve_path`` engine response."""
+
+    if not isinstance(spec, ContinuationSpec):
+        raise OracleValidationError(
+            "continuation response requires ContinuationSpec"
+        )
+    execution_context = _execution_context(
+        offline_only_acknowledged,
+        owned_simulator_acknowledged,
+    )
+    if binary_sha256 is not None and not re.fullmatch(
+        r"[0-9a-f]{64}",
+        binary_sha256,
+    ):
+        raise OracleValidationError(
+            "binary_sha256 must be a lowercase SHA-256 digest"
+        )
+    expected_id = expected_id or spec.cache_key
+    response = _object(_loads_strict(payload), "response")
+    common = {"schema_version", "id", "operation", "status"}
+    if not common.issubset(response):
+        raise EngineProtocolError(
+            "continuation response is missing envelope fields"
+        )
+    if _integer(response["schema_version"], "schema_version") != SCHEMA_VERSION:
+        raise EngineProtocolError("unsupported engine schema_version")
+    if _string(response["id"], "id") != expected_id:
+        raise EngineProtocolError(
+            "continuation response id differs from the request"
+        )
+    if _string(response["operation"], "operation") != "solve_path":
+        raise EngineProtocolError(
+            "continuation response operation must be solve_path"
+        )
+    status = _string(response["status"], "status")
+    if status == "error":
+        _exact_keys(response, common | {"error"}, "error response")
+        error_body = _object(response["error"], "error")
+        _exact_keys(error_body, {"code", "message"}, "error")
+        raise EngineResponseError(
+            _string(error_body["code"], "error.code"),
+            _string(error_body["message"], "error.message"),
+        )
+    if status != "ok":
+        raise EngineProtocolError(
+            f"unsupported continuation status {status!r}"
+        )
+    _exact_keys(
+        response,
+        common
+        | {
+            "provenance",
+            "current_street",
+            "current_board",
+            "current_player",
+            "node_actions",
+            "node_total_reachable_weight",
+            "policies",
+            "conditional_ranges",
+            "convergence",
+            "memory",
+            "timings_ms",
+        },
+        "continuation success response",
+    )
+    solver = _validate_continuation_provenance(
+        spec,
+        response,
+        expected_offline_only_acknowledged=offline_only_acknowledged,
+        expected_owned_simulator_acknowledged=owned_simulator_acknowledged,
+    )
+    expected_street = {3: "FLOP", 4: "TURN", 5: "RIVER"}[
+        len(spec.current_board)
+    ]
+    if _string(response["current_street"], "current_street") != expected_street:
+        raise EngineProtocolError(
+            "continuation current_street differs from current_board"
+        )
+    board = _list(response["current_board"], "current_board")
+    if board != list(spec.current_board) or any(
+        not isinstance(card, str) for card in board
+    ):
+        raise EngineProtocolError(
+            "continuation current_board differs from the request"
+        )
+    if _string(response["current_player"], "current_player") != (
+        spec.acting_player.value
+    ):
+        raise EngineProtocolError(
+            "continuation current player differs from the request"
+        )
+    node_actions = _parse_expected_action_descriptors(
+        spec.modeled_actions,
+        response,
+        "node_actions",
+    )
+    policies, node_total = _parse_node_policies(
+        spec,  # type: ignore[arg-type]
+        response,
+        node_actions,
+    )
+    ranges = _parse_conditional_ranges(spec, response)
+    convergence = _validate_convergence(response, spec)
+    memory, timings = _validate_memory_and_timings(response, spec)
+    metadata_extra = [
+        ("abstraction", _string(solver["abstraction"], "solver.abstraction")),
+        ("algorithm", _string(solver["algorithm"], "solver.algorithm")),
+        ("allocation_mode", spec.parameters.allocation_mode.value),
+        ("chip_scale", str(spec.parameters.chip_scale)),
+        ("chip_unit", spec.parameters.chip_unit),
+        ("execution_context", execution_context),
+        (
+            "exploitability_pct_of_pot",
+            _decimal_text(
+                _number(
+                    convergence["exploitability_pct_of_pot"],
+                    "convergence.exploitability_pct_of_pot",
+                )
+            ),
+        ),
+        ("node_total_reachable_weight", _decimal_text(node_total)),
+        ("protocol_operation", "solve_path"),
+        ("protocol_schema", str(SCHEMA_VERSION)),
+        ("solver_commit", spec.parameters.solver_commit),
+        (
+            "estimated_uncompressed_bytes",
+            str(
+                _integer(
+                    memory["estimated_uncompressed_bytes"],
+                    "memory.estimated_uncompressed_bytes",
+                )
+            ),
+        ),
+        (
+            "estimated_compressed_bytes",
+            str(
+                _integer(
+                    memory["estimated_compressed_bytes"],
+                    "memory.estimated_compressed_bytes",
+                )
+            ),
+        ),
+        (
+            "memory_hard_limit_bytes",
+            str(_integer(memory["hard_limit_bytes"], "memory.hard_limit_bytes")),
+        ),
+    ]
+    for key in ("tree_build", "allocation", "solve", "extraction", "total"):
+        metadata_extra.append(
+            (
+                f"timing_{key}_ms",
+                _decimal_text(
+                    _number(timings[key], f"timings_ms.{key}")
+                ),
+            )
+        )
+    if binary_sha256 is not None:
+        metadata_extra.append(("binary_sha256", binary_sha256))
+    metadata = SolverMetadata(
+        solver_name=_string(solver["name"], "provenance.solver.name"),
+        solver_version=_string(solver["commit"], "provenance.solver.commit"),
+        iterations=_integer(
+            convergence["iterations"],
+            "convergence.iterations",
+        ),
+        elapsed_seconds=_number(timings["total"], "timings_ms.total")
+        / Decimal(1000),
+        exploitability=_number(
+            convergence["exploitability_units"],
+            "convergence.exploitability_units",
+        ),
+        converged=_boolean(
+            convergence["target_reached"],
+            "convergence.target_reached",
+        ),
+        extra=tuple(metadata_extra),
+    )
+    try:
+        return ContinuationResult.for_spec(
+            spec,
+            policies,
+            ranges,
+            metadata,
+        )
+    except OracleValidationError as error:
+        raise EngineProtocolError(
+            f"continuation result does not satisfy its specification: {error}"
+        ) from error
 
 
 def parse_engine_response(
@@ -1311,7 +1924,7 @@ def parse_engine_response(
             node_actions,
         )
     convergence = _validate_convergence(response, spec)
-    timings = _validate_memory_and_timings(response, spec)
+    memory, timings = _validate_memory_and_timings(response, spec)
     metadata_extra = [
         ("abstraction", _string(solver["abstraction"], "solver.abstraction")),
         ("algorithm", _string(solver["algorithm"], "solver.algorithm")),
@@ -1330,7 +1943,43 @@ def parse_engine_response(
         ),
         ("protocol_schema", str(SCHEMA_VERSION)),
         ("solver_commit", spec.parameters.solver_commit),
+        (
+            "estimated_uncompressed_bytes",
+            str(
+                _integer(
+                    memory["estimated_uncompressed_bytes"],
+                    "memory.estimated_uncompressed_bytes",
+                )
+            ),
+        ),
+        (
+            "estimated_compressed_bytes",
+            str(
+                _integer(
+                    memory["estimated_compressed_bytes"],
+                    "memory.estimated_compressed_bytes",
+                )
+            ),
+        ),
+        (
+            "memory_hard_limit_bytes",
+            str(
+                _integer(
+                    memory["hard_limit_bytes"],
+                    "memory.hard_limit_bytes",
+                )
+            ),
+        ),
     ]
+    for key in ("tree_build", "allocation", "solve", "extraction", "total"):
+        metadata_extra.append(
+            (
+                f"timing_{key}_ms",
+                _decimal_text(
+                    _number(timings[key], f"timings_ms.{key}")
+                ),
+            )
+        )
     if node_total_reachable is not None:
         metadata_extra.extend(
             (
@@ -1462,5 +2111,71 @@ class EngineClient:
         if completed.returncode != 0:
             raise EngineProcessError(
                 f"engine exited {completed.returncode} despite a success response"
+            )
+        return result
+
+    def solve_continuation(
+        self,
+        spec: ContinuationSpec,
+    ) -> ContinuationResult:
+        """Solve and traverse one complete flop-to-current public path."""
+
+        request = build_continuation_request(
+            spec,
+            offline_only_acknowledged=self.offline_only_acknowledged,
+            owned_simulator_acknowledged=self.owned_simulator_acknowledged,
+        )
+        binary_digest = self.binary_sha256
+        request_json = json.dumps(
+            request,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        try:
+            completed = _run_engine_process(
+                self.binary,
+                request_json,
+                timeout_seconds=float(self.timeout_seconds),
+            )
+        except subprocess.TimeoutExpired as error:
+            raise EngineTimeoutError(
+                f"local continuation engine exceeded {self.timeout_seconds} seconds"
+            ) from error
+        except OSError as error:
+            raise EngineProcessError(
+                f"failed to execute continuation engine: {error}"
+            ) from error
+        if _binary_digest(self.binary) != binary_digest:
+            raise EngineProcessError(
+                "engine binary changed while the continuation solve was running"
+            )
+
+        try:
+            result = parse_continuation_response(
+                spec,
+                completed.stdout,
+                expected_id=spec.cache_key,
+                binary_sha256=binary_digest,
+                offline_only_acknowledged=self.offline_only_acknowledged,
+                owned_simulator_acknowledged=(
+                    self.owned_simulator_acknowledged
+                ),
+            )
+        except EngineResponseError:
+            raise
+        except EngineProtocolError as error:
+            stderr = completed.stderr.strip()
+            suffix = f"; stderr={stderr!r}" if stderr else ""
+            if completed.returncode != 0:
+                raise EngineProcessError(
+                    f"engine exited {completed.returncode} with invalid "
+                    f"continuation response: {error}{suffix}"
+                ) from error
+            raise
+        if completed.returncode != 0:
+            raise EngineProcessError(
+                "engine exited nonzero despite a successful continuation response"
             )
         return result

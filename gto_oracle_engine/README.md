@@ -15,9 +15,12 @@ keyboard, vision, or model integration of its own.
 - Exact card-state enumeration with suit isomorphism; no hand-strength buckets.
 - Discounted CFR with a requested maximum iteration count and exploitability
   target.
-- Root or verified same-street descendant strategy, per-combo action frequencies, per-action EV estimates,
-  equilibrium EV estimates, equity, weights, convergence, timing, and estimated
-  memory in the response.
+- Root, verified same-street descendant, or exact flop-to-current continuation
+  strategy. Responses include per-combo action frequencies, per-action EV
+  estimates, equilibrium EV estimates, equity, weights, convergence, timing,
+  and estimated memory.
+- `solve_path` traverses exact turn/river chance cards and returns both players'
+  action-conditioned conditional ranges at the final node.
 - Integer chip units for pot, stack, and action amounts.
 
 This is not a six-max or multiway solver. The caller must supply defensible OOP
@@ -71,9 +74,9 @@ as a machine-specific path.
 
 The executable reads exactly one JSON request from standard input, writes exactly
 one JSON response to standard output, and exits. Unknown request fields are
-rejected. Schema version 1 supports the legacy `solve_root` operation and the
-strict `solve_node` operation for a non-empty same-street action path. Every
-request must select exactly one context:
+rejected. Schema version 1 supports the legacy `solve_root`, strict same-street
+`solve_node`, and cross-street `solve_path` operations. Every request must
+select exactly one context:
 
 - offline: `offline_only_acknowledged: true`, with no simulator field;
 - owned simulator: `offline_only_acknowledged: false` and
@@ -146,6 +149,39 @@ traverses only exact actions already present in that tree. A missing size,
 terminal/chance transition, unexpected actor, facing amount, or node action set
 is an error rather than a fuzzy match.
 
+`solve_path` always begins at a three-card `FLOP` root. Its tagged
+`path_history` interleaves exact public actions with exact chance cards:
+
+```json
+{
+  "operation": "solve_path",
+  "street": "FLOP",
+  "board": ["2c", "7d", "Jh"],
+  "path_history": [
+    {"type": "action", "action": {"kind": "CHECK", "amount": null}},
+    {"type": "action", "action": {"kind": "BET", "amount": 300}},
+    {"type": "action", "action": {"kind": "CALL", "amount": null}},
+    {"type": "deal", "card": "4s"}
+  ],
+  "expected_board": ["2c", "7d", "Jh", "4s"],
+  "expected_total_invested": [300, 300],
+  "expected_current_player": "OOP",
+  "expected_facing_bet": 0,
+  "expected_node_actions": [
+    {"kind": "CHECK", "amount": null},
+    {"kind": "BET", "amount": 575}
+  ]
+}
+```
+
+The omitted fields are the same complete ranges, tree, rake, stack, convergence,
+and execution-context fields shown in the root request. Before constructing the
+game, every observed legal bet/raise/all-in target is added alongside the base
+size menu. The solver is never given future board cards at the flop root; each
+card is introduced only by its chance step. The engine then verifies final
+board, actor, cumulative postflop investments, facing amount, and exact action
+set.
+
 `bet_sizes` and `rake` may be omitted. Their effective defaults are a single
 `50%` bet, a `2.5x` raise, and zero rake. `tree_options` is required so the
 all-in insertion, forced-all-in, action-merging, and donk-tree choices are never
@@ -182,11 +218,14 @@ percentage of the starting pot: `0.5` means 0.5%, not 50%.
 For each combo, `range_weight` is the Pio input weight,
 `normalized_weight` is the upstream compatibility mass, and `reach_weight` is
 that mass normalized across the player's reachable combos to sum to one.
-For `solve_node`, `policies` contains the current actor's positive-reach combos.
+For `solve_node` and `solve_path`, `policies` contains the current actor's
+positive-reach combos.
 It separately reports `input_range_weight`, equilibrium-conditioned
 `path_weight`, raw `joint_compatible_weight`, and
 `conditional_reach_weight`. A Hero combo omitted from this set is off the
 equilibrium path and must not be assigned an invented policy.
+`solve_path.conditional_ranges` applies the same four-weight decomposition to
+both OOP and IP, normalized independently at the final public node.
 
 Every successful response repeats `schema_version`, `id`, and the complete
 effective configuration under `provenance.effective_request`. Provenance also
@@ -196,8 +235,18 @@ request ID, schema version, commit, or effective configuration differs from the
 submitted request.
 
 The engine refuses a tree whose selected allocation estimate is larger than 8
-GiB before allocation. Large flop trees can still take substantial time and
-memory; start with river fixtures and narrow ranges.
+GiB by default. On a larger-memory solve machine, raise the audited guard
+explicitly:
+
+```sh
+GTO_ENGINE_MAX_MEMORY_GIB=128 \
+  /private/tmp/oracle-engine-target/release/gto-oracle-engine < request.json
+```
+
+The value must be a whole number from 1 through 4096. It is an allocation guard,
+not a request to reserve memory, and its effective byte value is returned in
+both solver provenance and memory metadata. Large flop trees can still take
+substantial time and memory; start with river fixtures and narrow ranges.
 
 ## Test
 
@@ -219,7 +268,10 @@ The suite includes a deterministic one-street Brown value/bluff game on
 `2s3h4d6c7c`: with a 20-unit pot and 10-unit stack, OOP holds AA or QQ against
 IP's KK. It checks that AA bets purely, QQ bluffs one third within an explicit
 1% tolerance, and exploitability reaches at most 0.001% of the pot. A separate
-tree test pins the three null/empty/custom donk semantics.
+tree test pins the three null/empty/custom donk semantics. A real cross-street
+test solves a flop tree, traverses check/bet/call and an exact turn card, then
+verifies that a private combo containing that turn card disappears from the
+conditional range.
 
 ## License
 

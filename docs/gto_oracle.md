@@ -6,9 +6,11 @@ wire protocol requires exactly one acknowledgement and records the selected
 context in provenance; neither context can impersonate the other.
 
 `live_gto.py` combines a separately validated six-max preflop blueprint with the
-owned-simulator context for conservatively reconstructed HU street roots and
-first check/bet descendants. Offline model evaluation remains separately gated
-by `--offline-confirmed` and never observes capture or keyboard state.
+owned-simulator context. A complete public transcript is solved from the true
+HU flop root and traversed action by action through turn/river; sparse captures
+retain the conservative street-root/first-bet fallback. Offline model evaluation
+remains separately gated by `--offline-confirmed` and never observes capture or
+keyboard state.
 
 ## Engine decision
 
@@ -36,12 +38,14 @@ Important limitations:
   been suspended since 2023.
 
 One screenshot at every Hero decision supplies enough checkpoints for four
-auditable paths: the untouched OOP root, IP after OOP checks, IP facing the
-first OOP bet, and OOP facing IP's bet after a previously captured Hero check.
-The router verifies contribution, pot, stack, position, and legal-action
-invariants before issuing `solve_node`. Prior calls/raises or contradictory OCR
-remain unsupported. Multiway snapshots must also remain unsupported; silently
-dropping opponents would not produce a GTO answer.
+legacy auditable paths: the untouched OOP root, IP after OOP checks, IP facing
+the first OOP bet, and OOP facing IP's bet after a previously captured Hero
+check. A gap-free `PublicHandHistory` removes that same-street restriction for
+hands that were HU at the flop: the router issues `solve_path`, traverses every
+exact action/chance node, and verifies board, actor, cumulative investment,
+facing amount, and final action set. Contradictory or incomplete transcripts
+remain unsupported. Strategically multiway postflop snapshots must also remain
+unsupported; silently dropping opponents would not produce a GTO answer.
 
 ## Preflop blueprint and range handoff
 
@@ -100,10 +104,10 @@ Known boundaries are explicit:
   inferred from the six-max artifact;
 - strategically multiway postflop remains unsupported;
 - folded-card bunching is not passed to the HU engine;
-- turn/river ranges currently retain preflop reach but are not conditioned on
-  skipped earlier postflop actions;
-- postflop bet trees are intentionally small and an unseen flop defaults to
-  cache-only;
+- complete HU transcripts condition both players' ranges on every postflop
+  action and board card; sparse transcripts never invent the missing path;
+- postflop bet trees remain intentionally small; live configuration may either
+  solve an unseen flop under an explicit deadline or require a cache hit;
 - neither exact source matching nor a bounded abstraction proves a full-game
   six-max Nash equilibrium.
 
@@ -137,6 +141,14 @@ iterations, execution context, solver commit, and binary hash.
 A full-range owned-simulator turn smoke test of the four live paths measured
 about 0.19–0.20 seconds fresh and about 0.03 seconds from SQLite cache on this
 machine. These timings exclude the preceding vision reconstruction.
+
+The cross-street end-to-end fixture in `gto_full_process_simulation.py` starts at
+the flop, crosses turn and river, exports both conditional ranges, serializes
+the remote response, and checks idempotent replay. On this Mac its tiny
+one-size river tree reached 0.0926% pot exploitability in 220 iterations and
+about 10.05 seconds, with 284,343,836 estimated uncompressed bytes. The fixture
+validates plumbing and convergence only; its synthetic ranges are not a
+production strategy profile.
 
 ## Evaluation contract
 

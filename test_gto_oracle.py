@@ -1044,6 +1044,10 @@ class EngineClientProtocolTests(unittest.TestCase):
             "offline",
             dict(result.metadata.extra)["execution_context"],
         )
+        extra = dict(result.metadata.extra)
+        self.assertEqual("1000", extra["estimated_uncompressed_bytes"])
+        self.assertEqual("500", extra["estimated_compressed_bytes"])
+        self.assertEqual("24", extra["timing_total_ms"])
 
     def test_owned_simulator_context_is_explicit_and_pinned(self):
         response = copy.deepcopy(self.response)

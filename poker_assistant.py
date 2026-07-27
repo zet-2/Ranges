@@ -40,6 +40,9 @@ from live_gto import (
     LiveGTOStatus,
     LiveGTORouter,
 )
+from gto_remote import RemoteGTOClient, RemoteGTOConfigurationError
+from gto_event_collector import PublicHandEventRecorder
+from gto_hand_history import PublicHandHistory, public_hand_to_wire
 from preflop_observation import (
     PreflopObservationError,
     current_decision as current_preflop_observation,
@@ -48,6 +51,27 @@ from preflop_observation import (
 
 load_dotenv()
 console = Console()
+
+VALID_STRATEGY_BACKENDS = frozenset(
+    {"CLAUDE", "HYBRID", "GTO", "GTO_HU"}
+)
+SOLVER_STRATEGY_BACKENDS = frozenset({"HYBRID", "GTO", "GTO_HU"})
+DEFAULT_STRATEGY_BACKEND = "GTO"
+
+# Strict solver-only routing is the default. GTO_HU is the explicit
+# solver-only mode for the currently bounded six-max-to-HU continuation: it
+# may display an approximate HU subgame result but never relabels it full GTO
+# and never falls back to a language model.
+STRATEGY_BACKEND = os.getenv(
+    "STRATEGY_BACKEND",
+    DEFAULT_STRATEGY_BACKEND,
+).strip().upper()
+if STRATEGY_BACKEND not in VALID_STRATEGY_BACKENDS:
+    console.print(
+        f"[yellow]Warning: unknown STRATEGY_BACKEND={STRATEGY_BACKEND!r}; "
+        f"using {DEFAULT_STRATEGY_BACKEND}[/yellow]"
+    )
+    STRATEGY_BACKEND = DEFAULT_STRATEGY_BACKEND
 
 # Configure Gemini (Vision)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -105,8 +129,11 @@ CLAUDE_FAST_TIMEOUT_SECONDS = min(
 CLAUDE_COACH_TIMEOUT_SECONDS = float(
     os.getenv("CLAUDE_COACH_TIMEOUT_SECONDS", "15.0")
 )
-if not ANTHROPIC_API_KEY:
-    console.print("[yellow]Warning: ANTHROPIC_API_KEY not found in .env (Strategy will fail)[/yellow]")
+if not ANTHROPIC_API_KEY and STRATEGY_BACKEND in {"CLAUDE", "HYBRID"}:
+    console.print(
+        "[yellow]Warning: ANTHROPIC_API_KEY not found in .env "
+        "(Claude strategy or fallback will fail)[/yellow]"
+    )
 
 anthropic_client = (
     Anthropic(
@@ -118,24 +145,39 @@ anthropic_client = (
     else None
 )
 
-# Strategy backend. GTO is opt-in and requires a truthful acknowledgement that
-# the target is a user-controlled simulator. HYBRID tries the exact supported
-# HU/OOP street-root node first and falls back to Claude everywhere else.
-STRATEGY_BACKEND = os.getenv("STRATEGY_BACKEND", "CLAUDE").strip().upper()
-if STRATEGY_BACKEND not in {"CLAUDE", "HYBRID", "GTO"}:
-    console.print(
-        f"[yellow]Warning: unknown STRATEGY_BACKEND={STRATEGY_BACKEND!r}; "
-        "using CLAUDE[/yellow]"
+def create_live_gto_router(
+    config: LiveGTOConfig,
+    *,
+    execution_mode: Optional[str] = None,
+    environment=None,
+):
+    """Create the explicit local or remote solver transport."""
+
+    env = os.environ if environment is None else environment
+    selected_mode = (
+        execution_mode
+        if execution_mode is not None
+        else env.get("GTO_EXECUTION_MODE", "local")
+    ).strip().lower()
+    if selected_mode == "local":
+        return LiveGTORouter(config)
+    if selected_mode == "remote":
+        # OCR, hand reconstruction, action validation, and freshness stay on
+        # this machine. Only the compact LiveDecisionState crosses the
+        # authenticated transport to the solve server.
+        return RemoteGTOClient.from_env(config, environment=env)
+    raise LiveGTOConfigurationError(
+        "GTO_EXECUTION_MODE must be 'local' or 'remote'"
     )
-    STRATEGY_BACKEND = "CLAUDE"
+
 
 live_gto_router = None
 live_gto_config_error = ""
 try:
     _live_gto_config = LiveGTOConfig.from_env(os.path.dirname(__file__))
-    if STRATEGY_BACKEND in {"HYBRID", "GTO"}:
-        live_gto_router = LiveGTORouter(_live_gto_config)
-except LiveGTOConfigurationError as error:
+    if STRATEGY_BACKEND in SOLVER_STRATEGY_BACKENDS:
+        live_gto_router = create_live_gto_router(_live_gto_config)
+except (LiveGTOConfigurationError, RemoteGTOConfigurationError) as error:
     live_gto_config_error = str(error)
     console.print(f"[yellow]Warning: live GTO disabled: {error}[/yellow]")
 
@@ -249,6 +291,11 @@ class HandHistory:
     snapshots: list = dataclasses.field(default_factory=list)
     last_action_on: int = -1
     last_street: str = ""
+    public_event_recorder: PublicHandEventRecorder = dataclasses.field(
+        default_factory=PublicHandEventRecorder,
+        repr=False,
+    )
+    public_hand_error: str = ""
     
     def is_new_hand(self, snapshot: GameSnapshot) -> bool:
         """Detect if this snapshot is from a new hand."""
@@ -332,6 +379,8 @@ class HandHistory:
     
     def add_snapshot(self, snapshot: GameSnapshot):
         """Add snapshot and update tracking."""
+        self.public_event_recorder.observe(snapshot)
+        self.public_hand_error = self.public_event_recorder.error
         self.snapshots.append(snapshot)
         self.last_action_on = snapshot.action_on_seat_index
         self.last_street = snapshot.meta_info.current_street
@@ -343,6 +392,16 @@ class HandHistory:
         self.last_action_on = -1
         self.last_street = ""
         self.hand_id = ""
+        self.public_event_recorder.reset()
+        self.public_hand_error = ""
+
+    @property
+    def public_hand(self):
+        """Return only a complete, gap-free public event transcript."""
+
+        if not self.public_event_recorder.complete:
+            return None
+        return self.public_event_recorder.history
     
     def to_json(self) -> str:
         """Format history for strategist."""
@@ -1251,7 +1310,9 @@ def parse_response(
     local_card_evidence_available = locally_dealt_seats is not None
     locally_dealt_seats = locally_dealt_seats or set()
     snapshot.timestamp = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-    snapshot.hand_id = str(int(time.time()))
+    # Second-resolution identifiers can collide when a hand resets quickly,
+    # which is unsafe for remote idempotency and mixed-strategy realization.
+    snapshot.hand_id = str(time.time_ns())
     
     try:
         # Clean up JSON
@@ -1601,11 +1662,27 @@ class GameRecorder:
             else:
                 f.write(json.dumps(content) + "\n")
 
-    def update(self, snapshot: GameSnapshot):
-        # Simply log the full snapshot
-        # Convert to dict first
-        data = dataclasses.asdict(snapshot)
-        self.log(data)
+    def update(
+        self,
+        snapshot: GameSnapshot,
+        *,
+        public_hand: PublicHandHistory | None = None,
+        public_hand_error: str = "",
+    ):
+        """Persist the raw snapshot and any independently replayable prefix."""
+
+        self.log(
+            {
+                "record_type": "snapshot",
+                "snapshot": dataclasses.asdict(snapshot),
+                "public_hand": (
+                    public_hand_to_wire(public_hand)
+                    if public_hand is not None
+                    else None
+                ),
+                "public_hand_error": public_hand_error,
+            }
+        )
 
 
 
@@ -4334,7 +4411,11 @@ def build_live_gto_state(
             preflop_observation = terminal_preflop_observation(
                 history,
                 snapshot,
-                require_heads_up=True,
+                # GTO strict will still reject every approximate postflop
+                # continuation.  Retaining a truthful multiway terminal lets
+                # GTO_HU recognize a later two-player subgame without
+                # rewriting the hand as if it reached the flop heads-up.
+                require_heads_up=False,
             )
     except PreflopObservationError as error:
         preflop_mapping_error = str(error)
@@ -4385,6 +4466,7 @@ def build_live_gto_state(
             street_root_confirmed=False,
             preflop_observation=preflop_observation,
             preflop_mapping_error=preflop_mapping_error,
+            public_hand=history.public_hand,
         )
 
     current_total_units = _live_bb_units(snapshot.board_state.total_pot)
@@ -4506,6 +4588,7 @@ def build_live_gto_state(
         mapping_error=mapping_error,
         preflop_observation=preflop_observation,
         preflop_mapping_error=preflop_mapping_error,
+        public_hand=history.public_hand,
     )
 
 
@@ -4518,12 +4601,12 @@ def evaluate_strategy_backend(
     router: Optional[LiveGTORouter] = None,
     client=None,
 ) -> StrategyEvaluation:
-    """Use GTO on supported simulator nodes and make every fallback explicit."""
+    """Route strategy without ever allowing an implicit Claude fallback."""
 
     selected_backend = (backend or STRATEGY_BACKEND).upper()
     if selected_backend == "CLAUDE":
         return evaluate_strategy_snapshot(snapshot, history, mode=mode, client=client)
-    if selected_backend not in {"HYBRID", "GTO"}:
+    if selected_backend not in SOLVER_STRATEGY_BACKENDS:
         raise ValueError(f"Unsupported strategy backend: {selected_backend}")
 
     started = time.perf_counter()
@@ -4538,46 +4621,56 @@ def evaluate_strategy_backend(
         reason = outcome.reason
 
     if outcome is not None and outcome.solved:
-        validated_gto_analysis = validate_strategy_amount(
-            outcome.analysis,
-            snapshot,
+        approximate = bool(getattr(outcome, "approximate", False)) or (
+            isinstance(outcome.source, str)
+            and outcome.source.strip().lower().startswith("approximate")
         )
-        if validated_gto_analysis.startswith("Strategy Error:"):
+        if selected_backend == "GTO" and approximate:
             reason = (
-                "solver action failed live legality validation: "
-                + validated_gto_analysis.removeprefix("Strategy Error:").strip()
+                "strict GTO mode rejected an explicitly approximate solver "
+                "result"
             )
         else:
-            solver_mode = (
-                "APPROXIMATE_SOLVER"
-                if outcome.source.lower().startswith("approximate")
-                else "GTO"
+            validated_gto_analysis = validate_strategy_amount(
+                outcome.analysis,
+                snapshot,
             )
-            prompt = json.dumps(
-                {
-                    "backend": solver_mode,
-                    "usage": "user_controlled_simulator_live",
-                    "state": dataclasses.asdict(live_state),
-                    "spec_key": outcome.spec.cache_key if outcome.spec else "",
-                },
-                indent=2,
-                default=str,
-            )
-            return StrategyEvaluation(
-                mode=solver_mode,
-                model=getattr(outcome, "model", "") or "b-inary/postflop-solver",
-                prompt=prompt,
-                raw_analysis=outcome.analysis,
-                sanitized_analysis=outcome.analysis,
-                validated_analysis=validated_gto_analysis,
-                final_analysis=validated_gto_analysis,
-                metrics=prepared.metrics,
-                hand_rank=prepared.hand_rank,
-                hand_details=prepared.hand_details,
-                strategy_context=prepared.strategy_context,
-                latency_seconds=time.perf_counter() - started,
-                source=outcome.source,
-            )
+            if validated_gto_analysis.startswith("Strategy Error:"):
+                reason = (
+                    "solver action failed live legality validation: "
+                    + validated_gto_analysis.removeprefix("Strategy Error:").strip()
+                )
+            else:
+                solver_mode = "APPROXIMATE_SOLVER" if approximate else "GTO"
+                outcome_spec = getattr(outcome, "spec", None)
+                outcome_spec_key = getattr(outcome, "effective_spec_key", "") or (
+                    outcome_spec.cache_key if outcome_spec is not None else ""
+                )
+                prompt = json.dumps(
+                    {
+                        "backend": solver_mode,
+                        "usage": "user_controlled_simulator_live",
+                        "state": dataclasses.asdict(live_state),
+                        "spec_key": outcome_spec_key,
+                    },
+                    indent=2,
+                    default=str,
+                )
+                return StrategyEvaluation(
+                    mode=solver_mode,
+                    model=getattr(outcome, "model", "") or "b-inary/postflop-solver",
+                    prompt=prompt,
+                    raw_analysis=outcome.analysis,
+                    sanitized_analysis=outcome.analysis,
+                    validated_analysis=validated_gto_analysis,
+                    final_analysis=validated_gto_analysis,
+                    metrics=prepared.metrics,
+                    hand_rank=prepared.hand_rank,
+                    hand_details=prepared.hand_details,
+                    strategy_context=prepared.strategy_context,
+                    latency_seconds=time.perf_counter() - started,
+                    source=outcome.source,
+                )
 
     status = (
         "failed"
@@ -4586,7 +4679,8 @@ def evaluate_strategy_backend(
         if outcome is not None
         else "unavailable"
     )
-    fallback_reason = f"GTO {status}: {reason}"
+    solver_label = "GTO_HU" if selected_backend == "GTO_HU" else "GTO"
+    fallback_reason = f"{solver_label} {status}: {reason}"
     if selected_backend == "HYBRID":
         fallback = evaluate_strategy_snapshot(
             snapshot,
@@ -4603,7 +4697,7 @@ def evaluate_strategy_backend(
         return fallback
 
     return StrategyEvaluation(
-        mode="GTO",
+        mode=solver_label,
         model="b-inary/postflop-solver",
         prompt="",
         raw_analysis="",
@@ -4760,7 +4854,11 @@ def run_analysis_flow(mode: str = "debug"):
         # 2. Hand History - Always add snapshot (user presses 'n' for new hand)
         current_history.add_snapshot(snapshot)
         if recorder:
-            recorder.update(snapshot)  # Log to file
+            recorder.update(
+                snapshot,
+                public_hand=current_history.public_hand,
+                public_hand_error=current_history.public_hand_error,
+            )
         console.print(f"[dim]📝 Turn {len(current_history.snapshots)} added to history[/dim]")
         
         analysis = ""
@@ -4944,7 +5042,7 @@ def main():
         f"[white]Mode: {PROMPT_MODE} | Backend: {STRATEGY_BACKEND}[/white]"
     )
     console.print(
-        "[yellow]'l' SNAPSHOT | 'j' STRATEGY | 'n' NEW HAND | "
+        "[yellow]'l' SNAPSHOT | 'j' CAPTURE + AUTO ROUTE | 'n' NEW HAND | "
         "'p' CHART | 'm' CLAUDE MODE | ESC quit[/yellow]\n"
     )
     

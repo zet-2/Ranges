@@ -550,6 +550,7 @@ class PreflopRouterIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(live.LiveGTOStatus.SOLVED, outcome.status)
         self.assertEqual("approximate preflop blueprint cache", outcome.source)
+        self.assertTrue(outcome.approximate)
         self.assertIn("**Approximate blueprint mix:**", outcome.analysis)
 
     def test_abstract_raise_uses_observed_last_full_raise_minimum(self):
@@ -692,7 +693,7 @@ class PostflopRangeIntegrationTests(unittest.TestCase):
         self.assertEqual(Decimal("0.25"), oop[hero])
         self.assertEqual(Decimal("0.4"), ip[villain_kqo])
         self.assertFalse(bundle.hero_combo_injected)
-        self.assertFalse(bundle.approximate)
+        self.assertTrue(bundle.approximate)
         self.assertTrue(
             any(
                 "folded-card bunching is omitted" in caveat

@@ -9,18 +9,21 @@ snapshots are never promoted into an invented raise/call history.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from enum import Enum
 import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
 import re
+import secrets
 import sqlite3
 import time
 from typing import Callable
 
+from gto_hand_history import PublicHandHistory
 from preflop_blueprint import (
     BlueprintError,
     BlueprintNode,
@@ -43,6 +46,8 @@ from gto_oracle import (
     ActionKind,
     AllocationMode,
     BetSizingConfig,
+    ContinuationResult,
+    ContinuationSpec,
     EngineClient,
     EngineClientError,
     EngineResponseError,
@@ -62,7 +67,21 @@ from gto_oracle import (
 
 
 PINNED_SOLVER_COMMIT = "9d1509fe5077d019825f833eed04b16d342dfda1"
-DEFAULT_ENGINE = Path("/private/tmp/oracle-engine-target/release/gto-oracle-engine")
+_REPOSITORY_ENGINE = (
+    Path(__file__).resolve().parent
+    / "gto_oracle_engine"
+    / "target"
+    / "release"
+    / "gto-oracle-engine"
+)
+_VERIFIED_TEMP_ENGINE = Path(
+    "/private/tmp/oracle-engine-target/release/gto-oracle-engine"
+)
+DEFAULT_ENGINE = (
+    _REPOSITORY_ENGINE
+    if _REPOSITORY_ENGINE.is_file()
+    else _VERIFIED_TEMP_ENGINE
+)
 RANKS = "AKQJT98765432"
 SUITS = "cdhs"
 _CARD_RE = re.compile(r"^[2-9TJQKA][cdhs]$")
@@ -96,7 +115,7 @@ class LiveGTOConfig:
     engine_path: Path = DEFAULT_ENGINE
     cache_path: Path = Path("gto_live_cache.sqlite3")
     range_data_path: Path = Path("poker_data.json")
-    range_source: str = "charts"
+    range_source: str = "blueprint"
     blueprint_cache_path: Path = Path("preflop_blueprint_cache")
     blueprint_allow_network: bool = False
     blueprint_match_mode: str = "exact"
@@ -106,14 +125,19 @@ class LiveGTOConfig:
     blueprint_network_timeout_seconds: Decimal = Decimal(10)
     chip_scale: int = 100
     bet_size_pct: Decimal = Decimal("50")
-    target_exploitability_pct: Decimal = Decimal("0.5")
-    max_iterations: int = 10_000
-    turn_timeout_seconds: Decimal = Decimal("2")
-    river_timeout_seconds: Decimal = Decimal("1")
-    flop_timeout_seconds: Decimal = Decimal("4")
-    flop_cache_only: bool = True
-    rake_rate_pct: Decimal = Decimal(0)
-    rake_cap_bb: Decimal = Decimal(0)
+    target_exploitability_pct: Decimal = Decimal("0.1")
+    max_iterations: int = 1_000_000
+    turn_timeout_seconds: Decimal = Decimal("5")
+    river_timeout_seconds: Decimal = Decimal("2")
+    flop_timeout_seconds: Decimal = Decimal("180")
+    flop_cache_only: bool = False
+    rake_rate_pct: Decimal = Decimal(5)
+    rake_cap_bb: Decimal = Decimal("0.5")
+    mix_secret: bytes = field(
+        default_factory=lambda: secrets.token_bytes(32),
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         if self.enabled and not self.owned_simulator_acknowledged:
@@ -145,6 +169,10 @@ class LiveGTOConfig:
         if not self.rake_cap_bb.is_finite() or self.rake_cap_bb < 0:
             raise LiveGTOConfigurationError(
                 "GTO rake cap must be finite and non-negative"
+            )
+        if not isinstance(self.mix_secret, bytes) or len(self.mix_secret) < 32:
+            raise LiveGTOConfigurationError(
+                "GTO mix secret must contain at least 32 private bytes"
             )
         if self.range_source not in {"charts", "blueprint"}:
             raise LiveGTOConfigurationError(
@@ -206,11 +234,21 @@ class LiveGTOConfig:
             return raw if raw.is_absolute() else base / raw
 
         try:
-            max_iterations = int(os.getenv("GTO_MAX_ITERATIONS", "10000"))
+            max_iterations = int(os.getenv("GTO_MAX_ITERATIONS", "1000000"))
         except ValueError as error:
             raise LiveGTOConfigurationError(
                 "GTO_MAX_ITERATIONS must be an integer"
             ) from error
+        raw_mix_secret = os.getenv("GTO_MIX_SECRET", "")
+        if raw_mix_secret and len(raw_mix_secret.encode("utf-8")) < 32:
+            raise LiveGTOConfigurationError(
+                "GTO_MIX_SECRET must contain at least 32 UTF-8 bytes"
+            )
+        mix_secret = (
+            hashlib.sha256(raw_mix_secret.encode("utf-8")).digest()
+            if raw_mix_secret
+            else secrets.token_bytes(32)
+        )
 
         return cls(
             enabled=flag("GTO_LIVE_ENABLED"),
@@ -218,7 +256,7 @@ class LiveGTOConfig:
             engine_path=path("GTO_ENGINE_PATH", str(DEFAULT_ENGINE)),
             cache_path=path("GTO_CACHE_PATH", "gto_live_cache.sqlite3"),
             range_data_path=path("GTO_RANGE_DATA_PATH", "poker_data.json"),
-            range_source=os.getenv("GTO_RANGE_SOURCE", "charts").strip().lower(),
+            range_source=os.getenv("GTO_RANGE_SOURCE", "blueprint").strip().lower(),
             blueprint_cache_path=path(
                 "PREFLOP_BLUEPRINT_CACHE_PATH", "preflop_blueprint_cache"
             ),
@@ -240,15 +278,16 @@ class LiveGTOConfig:
             ),
             bet_size_pct=decimal("GTO_BET_SIZE_PCT", "50"),
             target_exploitability_pct=decimal(
-                "GTO_TARGET_EXPLOITABILITY_PCT", "0.5"
+                "GTO_TARGET_EXPLOITABILITY_PCT", "0.1"
             ),
             max_iterations=max_iterations,
-            flop_timeout_seconds=decimal("GTO_FLOP_TIMEOUT_SECONDS", "4"),
-            turn_timeout_seconds=decimal("GTO_TURN_TIMEOUT_SECONDS", "2"),
-            river_timeout_seconds=decimal("GTO_RIVER_TIMEOUT_SECONDS", "1"),
-            flop_cache_only=flag("GTO_FLOP_CACHE_ONLY", "1"),
-            rake_rate_pct=decimal("GTO_RAKE_RATE_PCT", "0"),
-            rake_cap_bb=decimal("GTO_RAKE_CAP_BB", "0"),
+            flop_timeout_seconds=decimal("GTO_FLOP_TIMEOUT_SECONDS", "180"),
+            turn_timeout_seconds=decimal("GTO_TURN_TIMEOUT_SECONDS", "5"),
+            river_timeout_seconds=decimal("GTO_RIVER_TIMEOUT_SECONDS", "2"),
+            flop_cache_only=flag("GTO_FLOP_CACHE_ONLY", "0"),
+            rake_rate_pct=decimal("GTO_RAKE_RATE_PCT", "5"),
+            rake_cap_bb=decimal("GTO_RAKE_CAP_BB", "0.5"),
+            mix_secret=mix_secret,
         )
 
     def timeout_for(self, street: Street) -> Decimal:
@@ -285,6 +324,10 @@ class LiveDecisionState:
     mapping_error: str = ""
     preflop_observation: ObservedPreflopState | None = None
     preflop_mapping_error: str = ""
+    # Optional lossless preflop-to-current-node transcript.  The current
+    # conservative HU router does not invent one from sparse screenshots, but
+    # full/stateful server backends require it and can replay it independently.
+    public_hand: PublicHandHistory | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -307,12 +350,21 @@ class LiveGTOOutcome:
     source: str = ""
     model: str = ""
     cache_hit: bool = False
-    spec: SolveSpec | None = None
-    result: SolveResult | None = None
+    spec: SolveSpec | ContinuationSpec | None = None
+    result: SolveResult | ContinuationResult | None = None
+    approximate: bool = False
+    # Remote responses intentionally do not return the full (potentially very
+    # large) SolveSpec.  Preserve its canonical key so local audit records can
+    # still tie a recommendation to the exact server-side solve.
+    spec_key: str = ""
 
     @property
     def solved(self) -> bool:
         return self.status is LiveGTOStatus.SOLVED
+
+    @property
+    def effective_spec_key(self) -> str:
+        return self.spec.cache_key if self.spec is not None else self.spec_key
 
 
 @dataclass(frozen=True, slots=True)
@@ -351,7 +403,7 @@ def _normalized_legal_actions(actions: tuple[str, ...]) -> frozenset[str]:
 
 
 def _verified_hu_handoff_reason(state: LiveDecisionState) -> str:
-    """Return why the captured preflop-to-flop handoff is not trusted HU state."""
+    """Return why the preflop handoff cannot seed the current HU projection."""
 
     if state.preflop_mapping_error:
         return (
@@ -363,9 +415,9 @@ def _verified_hu_handoff_reason(state: LiveDecisionState) -> str:
         return "verified heads-up preflop handoff is missing"
     if not observation.terminal:
         return "verified preflop handoff is not terminal"
-    if len(observation.live_positions) != 2:
+    if len(observation.live_positions) < 2:
         return (
-            "verified preflop handoff was not heads-up: found "
+            "verified preflop handoff has fewer than two surviving positions: found "
             f"{len(observation.live_positions)} surviving positions"
         )
     try:
@@ -379,10 +431,9 @@ def _verified_hu_handoff_reason(state: LiveDecisionState) -> str:
         return f"postflop positions cannot verify the heads-up handoff: {error}"
     if len(expected_positions) != 2:
         return "Hero and villain positions do not identify two distinct players"
-    if observation.live_positions != expected_positions:
+    if not expected_positions.issubset(observation.live_positions):
         return (
-            "verified preflop survivors disagree with the current Hero/villain "
-            "positions"
+            "current Hero/villain positions were not both preflop survivors"
         )
     observed_hand_id = observation.provenance.hand_id.strip()
     if state.hand_id and observed_hand_id and observed_hand_id != state.hand_id:
@@ -727,7 +778,12 @@ class BlueprintRangeProvider:
         stack, notes = self._select_stack(observation, state.hero_position)
         tolerances = self._match_tolerances(observation)
         if observation.terminal:
-            resolution = self.resolver.resolve_hu_handoff(
+            terminal_resolver = (
+                self.resolver.resolve_hu_handoff
+                if len(observation.live_positions) == 2
+                else self.resolver.resolve_terminal_handoff
+            )
+            resolution = terminal_resolver(
                 stack=stack,
                 observed_contributions=observation.contribution_map,
                 observed_folded=observation.folded,
@@ -1043,9 +1099,28 @@ class BlueprintRangeProvider:
         ip_position = canonical_position(
             state.villain_position if state.hero_is_oop else state.hero_position
         )
-        if observation.live_positions != {oop_position, ip_position}:
+        current_positions = {oop_position, ip_position}
+        if not current_positions.issubset(observation.live_positions):
             raise LiveGTORangeError(
-                "preflop survivors disagree with the reconstructed HU postflop seats"
+                "current HU seats were not both preflop survivors"
+            )
+        projected_positions = observation.live_positions - current_positions
+        if projected_positions:
+            notes.append(
+                "HU projection begins after postflop fold(s) by "
+                + ", ".join(
+                    position
+                    for position in (
+                        "UTG",
+                        "HJ",
+                        "CO",
+                        "BTN",
+                        "SB",
+                        "BB",
+                    )
+                    if position in projected_positions
+                )
+                + "; their postflop folding strategy is not range-conditioned"
             )
 
         reach = self.resolver.walk_reaches(
@@ -1081,10 +1156,10 @@ class BlueprintRangeProvider:
             hero_combo_injected=False,
             provenance=provenance,
             approximations=tuple(notes),
-            approximate=(
-                self.config.blueprint_match_mode == "abstract"
-                or state.street.upper() in {"TURN", "RIVER"}
-            ),
+            # The six-max-origin HU solve omits the four folded ranges'
+            # card-removal distribution. Even an exact stack/action-path match
+            # is therefore not an exact continuation of the source game.
+            approximate=True,
         )
 
 
@@ -1109,11 +1184,19 @@ def _street_sizing_config(
     default_bet: str,
     observed_bet_units: int,
 ) -> BetSizingConfig:
-    """Use an exact additive size for a traversed bet on the current street."""
+    """Keep the base menu while adding an exact traversed off-tree size.
+
+    Replacing the menu with the observed size would condition Villain's range
+    on a different game in which no alternative bet existed. The additive size
+    is therefore added alongside the configured base size and traversed exactly.
+    """
 
     standard = PlayerBetSizes(default_bet, "2.5x")
-    observed = PlayerBetSizes(f"{observed_bet_units}c", "2.5x")
-    current = observed if observed_bet_units else standard
+    current = (
+        PlayerBetSizes(f"{default_bet}, {observed_bet_units}c", "2.5x")
+        if observed_bet_units
+        else standard
+    )
     flop = StreetBetSizes(current, current) if street is Street.FLOP else StreetBetSizes(standard, standard)
     turn = StreetBetSizes(current, current) if street is Street.TURN else StreetBetSizes(standard, standard)
     river = StreetBetSizes(current, current) if street is Street.RIVER else StreetBetSizes(standard, standard)
@@ -1369,29 +1452,55 @@ def _eligibility_reason(state: LiveDecisionState) -> str:
     return ""
 
 
-def _stable_action(policy, seed: str):
-    digest = hashlib.sha256(seed.encode("utf-8")).digest()
-    roll = Decimal(int.from_bytes(digest[:8], "big")) / Decimal(2**64)
+def _private_roll(secret: bytes, seed: str) -> Decimal:
+    digest = hmac.digest(secret, seed.encode("utf-8"), "sha256")
+    return Decimal(int.from_bytes(digest[:8], "big")) / Decimal(2**64)
+
+
+def _select_private_mix(
+    items,
+    frequency: Callable[[object], Decimal],
+    seed: str,
+    secret: bytes,
+):
+    weighted = []
+    for item in items:
+        weight = frequency(item)
+        if weight > 0:
+            weighted.append((item, weight))
+    total = sum((weight for _, weight in weighted), Decimal(0))
+    if total <= 0:
+        raise LiveGTORangeError("mixed strategy has no positive probability mass")
+    roll = _private_roll(secret, seed)
+    threshold = roll * total
     cumulative = Decimal(0)
-    for value in policy.action_values:
-        cumulative += value.frequency
-        if roll < cumulative:
-            return value, roll
-    return policy.action_values[-1], roll
+    for item, weight in weighted:
+        cumulative += weight
+        if threshold < cumulative:
+            return item, roll
+    return weighted[-1][0], roll
+
+
+def _stable_action(policy, seed: str, secret: bytes):
+    return _select_private_mix(
+        policy.action_values,
+        lambda value: value.frequency,
+        seed,
+        secret,
+    )
 
 
 def _stable_blueprint_action(
     bundle: BlueprintDecisionBundle,
     seed: str,
+    secret: bytes,
 ) -> tuple[BlueprintPolicyAction, Decimal]:
-    digest = hashlib.sha256(seed.encode("utf-8")).digest()
-    roll = Decimal(int.from_bytes(digest[:8], "big")) / Decimal(2**64)
-    cumulative = Decimal(0)
-    for action in bundle.actions:
-        cumulative += action.frequency
-        if roll < cumulative:
-            return action, roll
-    return bundle.actions[-1], roll
+    return _select_private_mix(
+        bundle.actions,
+        lambda action: action.frequency,
+        seed,
+        secret,
+    )
 
 
 def _blueprint_action_label(
@@ -1478,7 +1587,7 @@ def _format_analysis(
     roll: Decimal,
     config: LiveGTOConfig,
     ranges: RangeBundle,
-    result: SolveResult,
+    result: SolveResult | ContinuationResult,
     source: str,
     state: LiveDecisionState,
 ) -> str:
@@ -1506,7 +1615,8 @@ def _format_analysis(
         else "no additional recorded approximation"
     )
     sizing_assumption = (
-        f"exact {format(state.observed_bet_to_bb.normalize(), 'f')} BB first bet"
+        f"configured {format(config.bet_size_pct.normalize(), 'f')}% pot first bet "
+        f"plus exact observed {format(state.observed_bet_to_bb.normalize(), 'f')} BB size"
         if state.observed_bet_to_bb > 0
         else f"{format(config.bet_size_pct.normalize(), 'f')}% pot first bet"
     )
@@ -1516,6 +1626,18 @@ def _format_analysis(
         if ranges.approximate
         else "Local solver mix"
     )
+    conditional_ranges = getattr(result, "conditional_ranges", ())
+    if conditional_ranges:
+        range_counts = ", ".join(
+            f"{item.position.value} {len(item.combos)} combos"
+            for item in conditional_ranges
+        )
+        continuity_line = (
+            "* **Range continuity:** action-conditioned from the verified "
+            f"flop root through every recorded action/card ({range_counts})\n"
+        )
+    else:
+        continuity_line = ""
     return (
         f"**Action:** {action}\n"
         f"**Size:** {size}\n"
@@ -1527,7 +1649,8 @@ def _format_analysis(
         f"* **Range assumption:** {ranges.profile_id}{injected}\n"
         f"* **Range provenance:** {provenance}\n"
         f"* **Approximation boundary:** {approximation_text}\n"
-        f"* **Tree assumption:** one {sizing_assumption}; one 2.5x response raise when legal\n"
+        f"{continuity_line}"
+        f"* **Tree assumption:** {sizing_assumption}; one 2.5x response raise when legal\n"
         f"* **Stable roll:** {float(roll) * 100:.2f}%"
     )
 
@@ -1578,6 +1701,52 @@ def _cache_put(cache: OracleCache, spec: SolveSpec, result: SolveResult) -> None
         ) from error
 
 
+def _continuation_cache_get(
+    cache: OracleCache,
+    spec: ContinuationSpec,
+    *,
+    digest: str,
+) -> ContinuationResult | None:
+    try:
+        return cache.get_continuation(
+            spec,
+            expected_binary_sha256=digest,
+            expected_execution_context="owned_simulator",
+        )
+    except (
+        sqlite3.Error,
+        json.JSONDecodeError,
+        InvalidOperation,
+        ValueError,
+        TypeError,
+        KeyError,
+    ) as error:
+        raise LiveGTOCacheError(
+            "live continuation cache entry is corrupt or unreadable: "
+            f"{error}"
+        ) from error
+
+
+def _continuation_cache_put(
+    cache: OracleCache,
+    spec: ContinuationSpec,
+    result: ContinuationResult,
+) -> None:
+    try:
+        cache.put_continuation(spec, result)
+    except (
+        sqlite3.Error,
+        json.JSONDecodeError,
+        InvalidOperation,
+        ValueError,
+        TypeError,
+        KeyError,
+    ) as error:
+        raise LiveGTOCacheError(
+            f"live continuation cache write failed: {error}"
+        ) from error
+
+
 class LiveGTORouter:
     """Cache-first solver router for the supported owned-simulator node."""
 
@@ -1596,6 +1765,158 @@ class LiveGTORouter:
         else:
             self.range_provider = PositionChartRangeProvider(config.range_data_path)
         self.engine_factory = engine_factory
+
+    def _evaluate_continuation(
+        self,
+        state: LiveDecisionState,
+        started: float,
+    ) -> LiveGTOOutcome:
+        """Solve a complete, replayed HU path from its true flop root."""
+
+        from live_gto_continuation import (
+            LiveGTOContinuationError,
+            build_live_continuation_spec,
+            flop_range_state,
+        )
+
+        try:
+            ranges = self.range_provider.ranges_for(flop_range_state(state))
+            spec = build_live_continuation_spec(state, ranges, self.config)
+            client = self.engine_factory(
+                self.config.engine_path,
+                offline_only_acknowledged=False,
+                owned_simulator_acknowledged=True,
+                # A continuation still solves the full flop tree before
+                # traversing turn/river, so it needs the flop budget.
+                timeout_seconds=self.config.timeout_for(Street.FLOP),
+            )
+            digest = client.binary_sha256
+            self.config.cache_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                with OracleCache(self.config.cache_path) as cache:
+                    result = _continuation_cache_get(
+                        cache,
+                        spec,
+                        digest=digest,
+                    )
+                    cache_hit = result is not None
+                    if result is not None and not result.metadata.converged:
+                        raise OracleValidationError(
+                            "cached continuation stopped before the requested "
+                            "exploitability target"
+                        )
+                    if result is None:
+                        if self.config.flop_cache_only:
+                            return LiveGTOOutcome(
+                                LiveGTOStatus.CACHE_MISS,
+                                "complete continuation is cache-only and this "
+                                "flop path is not cached",
+                                time.perf_counter() - started,
+                                spec=spec,
+                            )
+                        result = client.solve_continuation(spec)
+                        if not result.metadata.converged:
+                            raise OracleValidationError(
+                                "continuation solver stopped before the requested "
+                                "exploitability target"
+                            )
+                        _continuation_cache_put(cache, spec, result)
+            except sqlite3.Error as error:
+                raise LiveGTOCacheError(
+                    f"live continuation cache is unavailable: {error}"
+                ) from error
+
+            hero_combo = _ordered_combo(state.hero_combo)
+            policy = next(
+                (
+                    item
+                    for item in result.combo_policies
+                    if item.private_combo == hero_combo
+                ),
+                None,
+            )
+            source = _postflop_source(
+                cache_hit=cache_hit,
+                approximate=ranges.approximate,
+            )
+            if policy is None:
+                return LiveGTOOutcome(
+                    LiveGTOStatus.UNSUPPORTED,
+                    "Hero combo has zero reach after the complete recorded path",
+                    time.perf_counter() - started,
+                    source=source,
+                    cache_hit=cache_hit,
+                    spec=spec,
+                    result=result,
+                    approximate=ranges.approximate,
+                )
+            selected, roll = _stable_action(
+                policy,
+                f"{state.hand_id}:{spec.cache_key}:{','.join(hero_combo)}",
+                self.config.mix_secret,
+            )
+            analysis = _format_analysis(
+                policy,
+                selected,
+                roll,
+                self.config,
+                ranges,
+                result,
+                source,
+                state,
+            )
+            return LiveGTOOutcome(
+                LiveGTOStatus.SOLVED,
+                "",
+                time.perf_counter() - started,
+                analysis=analysis,
+                source=source,
+                model="b-inary/postflop-solver",
+                cache_hit=cache_hit,
+                spec=spec,
+                result=result,
+                approximate=ranges.approximate,
+            )
+        except EngineResponseError as error:
+            if error.code in {
+                "UNREACHABLE_NODE",
+                "NODE_PATH_ERROR",
+                "NODE_MISMATCH",
+            }:
+                return LiveGTOOutcome(
+                    LiveGTOStatus.UNSUPPORTED,
+                    "complete public path is not reachable in the solver tree: "
+                    f"{error.message}",
+                    time.perf_counter() - started,
+                )
+            return LiveGTOOutcome(
+                LiveGTOStatus.FAILED,
+                str(error),
+                time.perf_counter() - started,
+            )
+        except (
+            LiveGTOContinuationError,
+            LiveGTORangeError,
+            PreflopHistoryError,
+        ) as error:
+            return LiveGTOOutcome(
+                LiveGTOStatus.UNSUPPORTED,
+                str(error),
+                time.perf_counter() - started,
+            )
+        except (
+            BlueprintError,
+            LiveGTOCacheError,
+            LiveGTOConfigurationError,
+            EngineClientError,
+            OracleValidationError,
+            OSError,
+        ) as error:
+            return LiveGTOOutcome(
+                LiveGTOStatus.FAILED,
+                str(error),
+                time.perf_counter() - started,
+            )
 
     def evaluate(self, state: LiveDecisionState) -> LiveGTOOutcome:
         started = time.perf_counter()
@@ -1627,6 +1948,7 @@ class LiveGTORouter:
                         f"{state.hand_id}:{bundle.stack}:{bundle.history}:"
                         f"{','.join(_ordered_combo(state.hero_combo))}"
                     ),
+                    self.config.mix_secret,
                 )
                 analysis = _format_blueprint_analysis(
                     bundle, selected, roll, state
@@ -1643,6 +1965,7 @@ class LiveGTORouter:
                     analysis=analysis,
                     source=source,
                     model="PokerStudy MonkerSolver NL v2 blueprint",
+                    approximate=bundle.approximate,
                 )
             except PreflopHistoryError as error:
                 return LiveGTOOutcome(
@@ -1662,6 +1985,8 @@ class LiveGTORouter:
                     str(error),
                     time.perf_counter() - started,
                 )
+        if state.public_hand is not None:
+            return self._evaluate_continuation(state, started)
         reason = _eligibility_reason(state)
         if reason:
             return LiveGTOOutcome(
@@ -1729,6 +2054,7 @@ class LiveGTORouter:
             selected, roll = _stable_action(
                 policy,
                 f"{state.hand_id}:{spec.cache_key}:{','.join(hero_combo)}",
+                self.config.mix_secret,
             )
             source = _postflop_source(
                 cache_hit=cache_hit,
@@ -1747,6 +2073,7 @@ class LiveGTORouter:
                 cache_hit=cache_hit,
                 spec=spec,
                 result=result,
+                approximate=ranges.approximate,
             )
         except EngineResponseError as error:
             if error.code == "UNREACHABLE_NODE":

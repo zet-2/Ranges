@@ -62,6 +62,7 @@ from gto_oracle import (
 BENCHMARK_SCHEMA_VERSION = 2
 CASE_FILE_SCHEMA_VERSION = 1
 RESPONSE_CACHE_SCHEMA_VERSION = 1
+ORACLE_VALIDATION_SCHEMA_VERSION = 1
 PROMPT_VERSION = "gto-oracle-action-v2"
 DEFAULT_FAST_MODEL = "claude-haiku-4-5"
 DEFAULT_COACH_MODEL = "claude-sonnet-5"
@@ -72,6 +73,7 @@ DEFAULT_OUTPUT_DIR = Path("benchmark_results/gto_oracle")
 DEFAULT_RESPONSE_CACHE = DEFAULT_OUTPUT_DIR / "model_responses.jsonl"
 DEFAULT_ORACLE_CACHE = DEFAULT_OUTPUT_DIR / "oracle.sqlite3"
 PINNED_SOLVER_COMMIT = "9d1509fe5077d019825f833eed04b16d342dfda1"
+VALIDATION_SUITE_NAMES = ("demo", "representative", "stress")
 
 SYSTEM_PROMPT = (
     "You are evaluating an already completed heads-up no-limit Hold'em hand "
@@ -767,6 +769,391 @@ def demo_cases() -> list[OracleBenchmarkCase]:
         spec=medium_river_spec,
     )
     return [river, turn, medium_river]
+
+
+def _uniform_bet_sizing(bet_sizes: str) -> BetSizingConfig:
+    player = PlayerBetSizes(bet_sizes, "2.5x")
+    street = StreetBetSizes(player, player)
+    return BetSizingConfig(
+        flop=street,
+        turn=street,
+        river=street,
+        flop_donk_sizes=None,
+        turn_donk_sizes=None,
+        river_donk_sizes=None,
+    )
+
+
+def representative_validation_cases() -> list[OracleBenchmarkCase]:
+    """Return a low-cost, stratified HU postflop validation corpus.
+
+    The corpus is intentionally bounded enough for frequent server runs.  It
+    exercises materially different boards and tree contracts without including
+    the multi-gigabyte two-size flop used by the separate stress suite.
+    """
+
+    cases = demo_cases()
+    base_turn = cases[1].spec
+    medium_river = cases[2].spec
+
+    def parameters(
+        source: SolveSpec,
+        *,
+        bet_sizes: str = "50%",
+        target: str,
+        allocation: AllocationMode = AllocationMode.UNCOMPRESSED_F32,
+        river_donk_sizes: str | None = None,
+    ) -> SolveParameters:
+        sizing = replace(
+            _uniform_bet_sizing(bet_sizes),
+            river_donk_sizes=river_donk_sizes,
+        )
+        return replace(
+            source.parameters,
+            bet_sizes=sizing,
+            target_exploitability_pct=Decimal(target),
+            max_iterations=50_000,
+            allocation_mode=allocation,
+        )
+
+    def root_case(
+        case_id: str,
+        description: str,
+        source: SolveSpec,
+        *,
+        street: Street,
+        board: tuple[str, ...],
+        bet_sizes: str = "50%",
+        bet_amounts: tuple[int, ...] = (50,),
+        target: str,
+        effective_stack: int = 400,
+        rake_rate_pct: str = "0",
+        rake_cap: int = 0,
+        allocation: AllocationMode = AllocationMode.UNCOMPRESSED_F32,
+        river_donk_sizes: str | None = None,
+    ) -> OracleBenchmarkCase:
+        spec = replace(
+            source,
+            street=street,
+            board=board,
+            acting_player=Position.OOP,
+            tree=TreeConfig(
+                pot=100,
+                effective_stack=effective_stack,
+                facing_bet=0,
+                legal_action_kinds=(ActionKind.CHECK, ActionKind.BET),
+                modeled_actions=(
+                    Action(ActionKind.CHECK),
+                    *(Action(ActionKind.BET, amount) for amount in bet_amounts),
+                ),
+                rake_rate_pct=Decimal(rake_rate_pct),
+                rake_cap=rake_cap,
+            ),
+            parameters=parameters(
+                source,
+                bet_sizes=bet_sizes,
+                target=target,
+                allocation=allocation,
+                river_donk_sizes=river_donk_sizes,
+            ),
+        )
+        return OracleBenchmarkCase(case_id, description, spec)
+
+    cases.extend(
+        [
+            root_case(
+                "flop-dynamic-one-size-medium-ranges",
+                "Dynamic two-tone flop with 22 explicit combos per player and one 50% size.",
+                medium_river,
+                street=Street.FLOP,
+                board=("Td", "9d", "6h"),
+                target="0.5",
+            ),
+            root_case(
+                "flop-paired-one-size",
+                "Paired flop root with weighted ranges and one 50% size.",
+                base_turn,
+                street=Street.FLOP,
+                board=("2c", "2d", "9c"),
+                target="0.5",
+            ),
+            root_case(
+                "flop-monotone-one-size",
+                "Monotone flop root with weighted ranges and one 50% size.",
+                base_turn,
+                street=Street.FLOP,
+                board=("2h", "3h", "4h"),
+                target="0.5",
+            ),
+            root_case(
+                "turn-paired-one-size",
+                "Paired turn board at SPR 4 with one 50% size.",
+                base_turn,
+                street=Street.TURN,
+                board=("2c", "2d", "9c", "Qh"),
+                target="0.1",
+            ),
+            root_case(
+                "turn-four-flush-one-size",
+                "Four-heart turn board at SPR 4 with one 50% size.",
+                base_turn,
+                street=Street.TURN,
+                board=("2h", "3h", "4h", "6h"),
+                target="0.1",
+            ),
+            root_case(
+                "turn-dry-two-size",
+                "Dry turn root with 33% and 75% bet sizes.",
+                base_turn,
+                street=Street.TURN,
+                board=("Qs", "Tc", "6d", "2c"),
+                bet_sizes="33%, 75%",
+                bet_amounts=(33, 75),
+                target="0.1",
+            ),
+            root_case(
+                "river-paired-two-size",
+                "Paired river root with 33% and 75% bet sizes.",
+                base_turn,
+                street=Street.RIVER,
+                board=("2c", "2d", "9c", "Qh", "6s"),
+                bet_sizes="33%, 75%",
+                bet_amounts=(33, 75),
+                target="0.01",
+            ),
+            root_case(
+                "river-four-flush-two-size",
+                "Four-heart river root with 33% and 75% bet sizes.",
+                base_turn,
+                street=Street.RIVER,
+                board=("2h", "3h", "4h", "6h", "9s"),
+                bet_sizes="33%, 75%",
+                bet_amounts=(33, 75),
+                target="0.01",
+            ),
+            root_case(
+                "river-dry-two-size",
+                "Dry river root with 33% and 75% bet sizes.",
+                base_turn,
+                street=Street.RIVER,
+                board=("Qs", "Tc", "6d", "2c", "9h"),
+                bet_sizes="33%, 75%",
+                bet_amounts=(33, 75),
+                target="0.01",
+            ),
+        ]
+    )
+
+    descendant_parameters = parameters(base_turn, target="0.1")
+    descendant_common = {
+        "pot": 100,
+        "effective_stack": 400,
+        "rake_rate_pct": Decimal(0),
+        "rake_cap": 0,
+    }
+    cases.extend(
+        [
+            OracleBenchmarkCase(
+                "turn-ip-after-oop-check",
+                "IP check/bet decision after OOP checks the turn.",
+                replace(
+                    base_turn,
+                    acting_player=Position.IP,
+                    tree=TreeConfig(
+                        **descendant_common,
+                        facing_bet=0,
+                        legal_action_kinds=(ActionKind.CHECK, ActionKind.BET),
+                        modeled_actions=(
+                            Action(ActionKind.CHECK),
+                            Action(ActionKind.BET, 50),
+                        ),
+                        action_history=(Action(ActionKind.CHECK),),
+                    ),
+                    parameters=descendant_parameters,
+                ),
+            ),
+            OracleBenchmarkCase(
+                "turn-ip-facing-oop-bet",
+                "IP fold/call/raise decision after OOP bets 50 on the turn.",
+                replace(
+                    base_turn,
+                    acting_player=Position.IP,
+                    tree=TreeConfig(
+                        **descendant_common,
+                        facing_bet=50,
+                        legal_action_kinds=(
+                            ActionKind.FOLD,
+                            ActionKind.CALL,
+                            ActionKind.RAISE,
+                        ),
+                        modeled_actions=(
+                            Action(ActionKind.FOLD),
+                            Action(ActionKind.CALL),
+                            Action(ActionKind.RAISE, 125),
+                        ),
+                        action_history=(Action(ActionKind.BET, 50),),
+                    ),
+                    parameters=descendant_parameters,
+                ),
+            ),
+            OracleBenchmarkCase(
+                "turn-oop-facing-ip-bet",
+                "OOP fold/call/raise decision after check and an IP bet of 50.",
+                replace(
+                    base_turn,
+                    acting_player=Position.OOP,
+                    tree=TreeConfig(
+                        **descendant_common,
+                        facing_bet=50,
+                        legal_action_kinds=(
+                            ActionKind.FOLD,
+                            ActionKind.CALL,
+                            ActionKind.RAISE,
+                        ),
+                        modeled_actions=(
+                            Action(ActionKind.FOLD),
+                            Action(ActionKind.CALL),
+                            Action(ActionKind.RAISE, 125),
+                        ),
+                        action_history=(
+                            Action(ActionKind.CHECK),
+                            Action(ActionKind.BET, 50),
+                        ),
+                    ),
+                    parameters=descendant_parameters,
+                ),
+            ),
+        ]
+    )
+
+    cases.extend(
+        [
+            root_case(
+                "turn-rake-five-percent",
+                "Turn root with 5% rake capped at 0.5 BB.",
+                base_turn,
+                street=Street.TURN,
+                board=("Td", "9d", "6h", "Qc"),
+                target="0.1",
+                rake_rate_pct="5",
+                rake_cap=50,
+            ),
+            root_case(
+                "river-rake-five-percent",
+                "River root with two bet sizes and 5% rake capped at 0.5 BB.",
+                base_turn,
+                street=Street.RIVER,
+                board=("Td", "9d", "6h", "Qc", "2s"),
+                bet_sizes="33%, 75%",
+                bet_amounts=(33, 75),
+                target="0.01",
+                rake_rate_pct="5",
+                rake_cap=50,
+            ),
+            root_case(
+                "turn-shallow-spr-two",
+                "Turn root with a 200-unit effective stack (SPR 2).",
+                base_turn,
+                street=Street.TURN,
+                board=("Td", "9d", "6h", "Qc"),
+                target="0.1",
+                effective_stack=200,
+            ),
+            root_case(
+                "turn-deep-spr-eight",
+                "Turn root with an 800-unit effective stack (SPR 8).",
+                base_turn,
+                street=Street.TURN,
+                board=("Td", "9d", "6h", "Qc"),
+                target="0.1",
+                effective_stack=800,
+            ),
+            root_case(
+                "turn-compressed-allocation",
+                "Turn root using the compressed i16 strategy allocation.",
+                base_turn,
+                street=Street.TURN,
+                board=("Td", "9d", "6h", "Qc"),
+                target="0.1",
+                allocation=AllocationMode.COMPRESSED_I16,
+            ),
+            root_case(
+                "turn-river-donk-disabled",
+                "Turn tree with river donk sizes explicitly disabled.",
+                base_turn,
+                street=Street.TURN,
+                board=("Td", "9d", "6h", "Qc"),
+                target="0.1",
+                river_donk_sizes="",
+            ),
+            root_case(
+                "turn-river-donk-quarter-pot",
+                "Turn tree with an explicit 25% river donk size.",
+                base_turn,
+                street=Street.TURN,
+                board=("Td", "9d", "6h", "Qc"),
+                target="0.1",
+                river_donk_sizes="25%",
+            ),
+        ]
+    )
+    return cases
+
+
+def stress_validation_cases() -> list[OracleBenchmarkCase]:
+    """Add two expensive flop precision/tree cases to the representative suite."""
+
+    cases = representative_validation_cases()
+    medium_flop = cases[3].spec
+
+    tight_one_size = replace(
+        medium_flop,
+        parameters=replace(
+            medium_flop.parameters,
+            target_exploitability_pct=Decimal("0.1"),
+        ),
+    )
+    two_size = replace(
+        medium_flop,
+        tree=replace(
+            medium_flop.tree,
+            modeled_actions=(
+                Action(ActionKind.CHECK),
+                Action(ActionKind.BET, 33),
+                Action(ActionKind.BET, 75),
+            ),
+        ),
+        parameters=replace(
+            medium_flop.parameters,
+            bet_sizes=_uniform_bet_sizing("33%, 75%"),
+            target_exploitability_pct=Decimal("0.5"),
+        ),
+    )
+    cases.extend(
+        [
+            OracleBenchmarkCase(
+                "flop-dynamic-one-size-tight",
+                "Dynamic flop one-size solve with a tighter 0.1% target.",
+                tight_one_size,
+            ),
+            OracleBenchmarkCase(
+                "flop-dynamic-two-size-stress",
+                "Dynamic flop with 33% and 75% sizes; intentionally memory-heavy.",
+                two_size,
+            ),
+        ]
+    )
+    return cases
+
+
+def validation_suite(name: str) -> list[OracleBenchmarkCase]:
+    if name == "demo":
+        return demo_cases()
+    if name == "representative":
+        return representative_validation_cases()
+    if name == "stress":
+        return stress_validation_cases()
+    raise BenchmarkError(f"unknown validation suite {name!r}")
 
 
 def case_file_data(cases: Sequence[OracleBenchmarkCase]) -> dict[str, Any]:
@@ -1861,6 +2248,144 @@ def build_report(
     }
 
 
+def build_oracle_validation_report(
+    cases: Sequence[OracleBenchmarkCase],
+    oracle_results: dict[str, SolveResult],
+    oracle_cache_hits: dict[str, bool],
+    *,
+    engine_binary: str,
+    engine_timeout_seconds: float,
+    suite_name: str = "custom",
+) -> dict[str, Any]:
+    """Describe an offline solve-only run without any model/API calls."""
+
+    expected_keys = {case.spec.cache_key for case in cases}
+    if set(oracle_results) != expected_keys:
+        raise BenchmarkError("oracle validation results do not match the case set")
+    if set(oracle_cache_hits) != expected_keys:
+        raise BenchmarkError("oracle cache metadata does not match the case set")
+
+    rows = []
+    for case in cases:
+        result = oracle_results[case.spec.cache_key]
+        metadata = result.metadata
+        extra = dict(metadata.extra)
+        rows.append(
+            {
+                "case_id": case.case_id,
+                "description": case.description,
+                "spec_key": case.spec.cache_key,
+                "street": case.spec.street.value,
+                "board": list(case.spec.board),
+                "cache_hit": oracle_cache_hits[case.spec.cache_key],
+                "solver": metadata.solver_name,
+                "solver_version": metadata.solver_version,
+                "iterations": metadata.iterations,
+                "elapsed_seconds": str(metadata.elapsed_seconds),
+                "target_exploitability_pct": str(
+                    case.spec.parameters.target_exploitability_pct
+                ),
+                "exploitability_units": str(metadata.exploitability),
+                "exploitability_pct_of_pot": extra.get(
+                    "exploitability_pct_of_pot"
+                ),
+                "converged": metadata.converged,
+                "memory": {
+                    "estimated_uncompressed_bytes": extra.get(
+                        "estimated_uncompressed_bytes"
+                    ),
+                    "estimated_compressed_bytes": extra.get(
+                        "estimated_compressed_bytes"
+                    ),
+                    "hard_limit_bytes": extra.get(
+                        "memory_hard_limit_bytes"
+                    ),
+                    "allocation_mode": extra.get("allocation_mode"),
+                },
+                "timings_ms": {
+                    name: extra.get(f"timing_{name}_ms")
+                    for name in (
+                        "tree_build",
+                        "allocation",
+                        "solve",
+                        "extraction",
+                        "total",
+                    )
+                },
+                "metadata": extra,
+            }
+        )
+
+    elapsed_values = [
+        oracle_results[case.spec.cache_key].metadata.elapsed_seconds
+        for case in cases
+    ]
+    suite_identity = [
+        {"case_id": case.case_id, "spec_key": case.spec.cache_key}
+        for case in cases
+    ]
+    return {
+        "schema_version": ORACLE_VALIDATION_SCHEMA_VERSION,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "purpose": "offline_server_solver_validation",
+        "suite": suite_name,
+        "suite_fingerprint": hashlib.sha256(
+            canonical_json(suite_identity).encode("utf-8")
+        ).hexdigest(),
+        "run_complete": all(row["converged"] for row in rows),
+        "case_count": len(rows),
+        "fresh_solves": sum(not row["cache_hit"] for row in rows),
+        "cache_hits": sum(row["cache_hit"] for row in rows),
+        "solver_elapsed_seconds_total": str(
+            sum(elapsed_values, Decimal(0))
+        ),
+        "solver_elapsed_seconds_max": str(max(elapsed_values)),
+        "coverage": {
+            "streets": dict(
+                sorted(Counter(case.spec.street.value for case in cases).items())
+            ),
+            "nodes": dict(
+                sorted(
+                    Counter(
+                        "descendant" if case.spec.tree.action_history else "root"
+                        for case in cases
+                    ).items()
+                )
+            ),
+            "allocation_modes": dict(
+                sorted(
+                    Counter(
+                        case.spec.parameters.allocation_mode.value
+                        for case in cases
+                    ).items()
+                )
+            ),
+            "effective_stacks": dict(
+                sorted(
+                    Counter(
+                        str(case.spec.tree.effective_stack)
+                        for case in cases
+                    ).items(),
+                    key=lambda item: int(item[0]),
+                )
+            ),
+            "raked_cases": sum(
+                case.spec.tree.rake_rate_pct > 0 for case in cases
+            ),
+        },
+        "engine_binary": engine_binary,
+        "engine_timeout_seconds": engine_timeout_seconds,
+        "cases": rows,
+        "limitations": [
+            "This bundled oracle validates heads-up NLHE postflop nodes only.",
+            "It does not certify six-max, multiway, preflop, or folded-card bunching.",
+            "Results are conditional on the exact supplied ranges, rake, stacks, and discrete action tree.",
+            "A representative corpus and an independent solver cross-check are required before a backend quality claim.",
+            "The command is offline/post-session only and performs no model or vision API calls.",
+        ],
+    }
+
+
 def _write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -1936,8 +2461,49 @@ def build_parser() -> argparse.ArgumentParser:
     demo = subparsers.add_parser("write-demo", help="write the transparent demo case JSON")
     demo.add_argument("--output", type=Path, default=Path("benchmark_data/gto_oracle/demo.json"))
 
+    write_suite = subparsers.add_parser(
+        "write-suite",
+        help="write a built-in offline validation suite as strict case JSON",
+    )
+    write_suite.add_argument(
+        "--suite",
+        choices=VALIDATION_SUITE_NAMES,
+        default="representative",
+    )
+    write_suite.add_argument("--output", type=Path, required=True)
+
     validate = subparsers.add_parser("validate", help="strictly validate a case file")
     validate.add_argument("--cases", type=Path, required=True)
+
+    solve = subparsers.add_parser(
+        "solve",
+        help="solve an offline corpus and report convergence without model calls",
+    )
+    solve.add_argument(
+        "--offline-confirmed",
+        action="store_true",
+        help="confirm the poker client is closed and all hands are already complete",
+    )
+    solve_source = solve.add_mutually_exclusive_group()
+    solve_source.add_argument(
+        "--cases",
+        type=Path,
+        help="strict case JSON; default is the small built-in validation suite",
+    )
+    solve_source.add_argument(
+        "--suite",
+        choices=VALIDATION_SUITE_NAMES,
+        default="demo",
+        help="built-in suite to solve (default: demo)",
+    )
+    solve.add_argument("--engine", type=Path, default=DEFAULT_ENGINE)
+    solve.add_argument("--engine-timeout", type=_positive_float, default=600.0)
+    solve.add_argument("--oracle-cache", type=Path, default=DEFAULT_ORACLE_CACHE)
+    solve.add_argument(
+        "--report",
+        type=Path,
+        default=DEFAULT_OUTPUT_DIR / "oracle_validation_report.json",
+    )
 
     run = subparsers.add_parser("run", help="solve, query cached/models, score, and report")
     run.add_argument(
@@ -1986,12 +2552,56 @@ def main(argv: list[str] | None = None) -> int:
         write_case_file(args.output, demo_cases())
         print(args.output)
         return 0
+    if args.command == "write-suite":
+        write_case_file(args.output, validation_suite(args.suite))
+        print(args.output)
+        return 0
     if args.command == "validate":
         cases = load_case_file(args.cases)
         print(f"Validated {len(cases)} offline HU postflop case(s)")
         for case in cases:
             print(f"  {case.case_id}: {case.spec.cache_key}")
         return 0
+
+    if args.command == "solve":
+        if not args.offline_confirmed:
+            parser.error(
+                "solve requires --offline-confirmed: close the poker client "
+                "and use completed hands only"
+            )
+        cases = (
+            load_case_file(args.cases)
+            if args.cases
+            else validation_suite(args.suite)
+        )
+        suite_name = f"file:{args.cases}" if args.cases else args.suite
+        args.oracle_cache.parent.mkdir(parents=True, exist_ok=True)
+        engine = EngineClient(
+            args.engine,
+            offline_only_acknowledged=True,
+            timeout_seconds=str(args.engine_timeout),
+        )
+        with OracleCache(args.oracle_cache) as oracle_cache:
+            oracle_results, oracle_hits = load_or_solve(
+                cases,
+                oracle_cache=oracle_cache,
+                engine=engine,
+            )
+        report = build_oracle_validation_report(
+            cases,
+            oracle_results,
+            oracle_hits,
+            engine_binary=str(args.engine),
+            engine_timeout_seconds=args.engine_timeout,
+            suite_name=suite_name,
+        )
+        _write_json(args.report, report)
+        print(
+            f"Solved {report['case_count']} offline HU postflop case(s): "
+            f"{report['fresh_solves']} fresh, {report['cache_hits']} cached"
+        )
+        print(f"Report: {args.report}")
+        return 0 if report["run_complete"] else 1
 
     if not args.offline_confirmed:
         parser.error(

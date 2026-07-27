@@ -306,6 +306,34 @@ def test_hu_terminal_path_can_end_when_third_player_folds() -> None:
     assert resolution.state.live_positions == frozenset({"BTN", "SB"})
 
 
+def test_generic_terminal_handoff_supports_three_flop_survivors() -> None:
+    decision = (
+        "UTG_60%_HJ_Fold_CO_Fold_BTN_Call_SB_Fold_BB"
+    )
+    store = FakeStore(
+        [decision],
+        {decision: _node(decision, "BB", _action("Call", {"AA": 1}))},
+    )
+    resolution = PreflopHistoryResolver(store).resolve_terminal_handoff(
+        stack=100,
+        observed_contributions={
+            "UTG": "2.5",
+            "HJ": "0",
+            "CO": "0",
+            "BTN": "2.5",
+            "SB": ".5",
+            "BB": "2.5",
+        },
+        observed_folded={"HJ", "CO", "SB"},
+        survivors={"UTG", "BTN", "BB"},
+    )
+    assert resolution.final_action == "Call"
+    assert resolution.state.terminal
+    assert resolution.state.live_positions == frozenset(
+        {"UTG", "BTN", "BB"}
+    )
+
+
 def test_cumulative_reach_replaces_previous_reach_instead_of_multiplying() -> None:
     paths = [
         ("UTG", "UTG", "60%", {"AA": ".8", "22": ".4"}),

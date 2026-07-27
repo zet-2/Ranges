@@ -1,0 +1,40 @@
+[Unit]
+Description=Ranges remote GTO evaluator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gto-oracle
+Group=gto-oracle
+WorkingDirectory=/opt/gto-oracle
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/gto-oracle/server.env
+ExecStart=/usr/bin/python3 -m gto_remote.server
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=30
+KillMode=control-group
+UMask=0077
+
+StateDirectory=gto-oracle
+ReadWritePaths=/var/lib/gto-oracle
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+LockPersonality=true
+RestrictSUIDSGID=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+TasksMax=512
+LimitNOFILE=4096
+
+# Set this above GTO_ENGINE_MAX_MEMORY_GIB but below physical RAM.
+# Examples: MemoryMax=112G with a 96-GiB engine guard, or MemoryMax=224G
+# with a 192-GiB guard on a 256-GiB host.
+# MemoryMax=112G
+
+[Install]
+WantedBy=multi-user.target

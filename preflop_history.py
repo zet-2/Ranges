@@ -621,6 +621,66 @@ class PreflopHistoryResolver:
         )
         if len(expected_survivors) != 2:
             raise NoMatchingHistoryError("HU handoff requires exactly two surviving positions")
+        return self._resolve_terminal_handoff(
+            stack=stack,
+            observed=observed,
+            tolerance=tolerance,
+            kind="HU terminal",
+        )
+
+    def resolve_terminal_handoff(
+        self,
+        *,
+        stack: int,
+        observed_contributions: Mapping[str, object],
+        observed_folded: Iterable[str],
+        survivors: Iterable[str] | None = None,
+        observed_all_in: Iterable[str] | None = None,
+        tolerance: object | None = None,
+    ) -> PreflopResolution:
+        """Resolve a completed preflop round with two or more survivors.
+
+        This is used by the explicitly approximate HU projection when a hand
+        reached the flop multiway but later observations prove that only Hero
+        and one opponent remain.  It resolves only the preflop terminal path;
+        it does not pretend the later fold was part of that preflop tree.
+        """
+
+        observed = ObservedPreflopState.create(
+            contributions=observed_contributions,
+            folded=observed_folded,
+            survivors=survivors,
+            all_in=observed_all_in,
+        )
+        expected_survivors = (
+            observed.survivors
+            if observed.survivors is not None
+            else frozenset(POSITIONS) - (observed.folded or frozenset())
+        )
+        if not 2 <= len(expected_survivors) <= len(POSITIONS):
+            raise NoMatchingHistoryError(
+                "terminal handoff requires between two and six surviving positions"
+            )
+        return self._resolve_terminal_handoff(
+            stack=stack,
+            observed=observed,
+            tolerance=tolerance,
+            kind="terminal",
+        )
+
+    def _resolve_terminal_handoff(
+        self,
+        *,
+        stack: int,
+        observed: ObservedPreflopState,
+        tolerance: object | None,
+        kind: str,
+    ) -> PreflopResolution:
+        expected_survivors = (
+            observed.survivors
+            if observed.survivors is not None
+            else frozenset(POSITIONS) - (observed.folded or frozenset())
+        )
         allowed = _coerce_tolerances(
             self.contribution_tolerance if tolerance is None else tolerance,
             (position for position, _ in observed.contributions),
@@ -680,7 +740,7 @@ class PreflopHistoryResolver:
                     )
                 except IllegalActionError:
                     continue
-                if len(state.live_positions) != 2:
+                if state.live_positions != expected_survivors:
                     continue
                 if _compatible(state, observed, allowed, terminal=True):
                     matches.append(
@@ -693,7 +753,7 @@ class PreflopHistoryResolver:
                             final_action=label,
                         )
                     )
-        return self._require_unique(matches, observed, kind="HU terminal")
+        return self._require_unique(matches, observed, kind=kind)
 
     @staticmethod
     def _require_unique(

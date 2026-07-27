@@ -6,6 +6,7 @@ from __future__ import annotations
 from dataclasses import replace
 from decimal import Decimal
 import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
@@ -374,6 +375,33 @@ class ConfigurationTests(unittest.TestCase):
             ):
                 live.LiveGTOConfig(**changes)
 
+    def test_mix_secret_is_private_stable_and_validated(self):
+        first = b"a" * 32
+        second = b"b" * 32
+        seed = "hand:node:combo"
+        self.assertEqual(
+            live._private_roll(first, seed),
+            live._private_roll(first, seed),
+        )
+        self.assertNotEqual(
+            live._private_roll(first, seed),
+            live._private_roll(second, seed),
+        )
+        with self.assertRaisesRegex(
+            live.LiveGTOConfigurationError,
+            "at least 32 private bytes",
+        ):
+            live.LiveGTOConfig(mix_secret=b"too-short")
+        with mock.patch.dict(
+            os.environ,
+            {"GTO_MIX_SECRET": "also-too-short"},
+            clear=True,
+        ), self.assertRaisesRegex(
+            live.LiveGTOConfigurationError,
+            "at least 32 UTF-8 bytes",
+        ):
+            live.LiveGTOConfig.from_env()
+
     def test_disabled_router_does_not_touch_ranges_or_engine(self):
         provider = StubRangeProvider()
         engine = SpyEngineFactory()
@@ -427,14 +455,6 @@ class EligibilityRoutingTests(unittest.TestCase):
                 ),
                 (
                     make_state(
-                        preflop_observation=make_hu_handoff(
-                            survivors=("BB", "BTN", "SB")
-                        )
-                    ),
-                    "was not heads-up",
-                ),
-                (
-                    make_state(
                         preflop_observation=None,
                         preflop_mapping_error=(
                             "postflop hand is not heads-up: found 3 live players"
@@ -467,6 +487,14 @@ class EligibilityRoutingTests(unittest.TestCase):
                     self.assertEqual(0, engine.digest_reads)
                     self.assertEqual([], engine.solve_calls)
             self.assertFalse(config.cache_path.exists())
+
+    def test_current_hu_can_be_projected_from_a_multiway_flop_handoff(self):
+        state = make_state(
+            preflop_observation=make_hu_handoff(
+                survivors=("BB", "BTN", "SB")
+            )
+        )
+        self.assertEqual("", live._verified_hu_handoff_reason(state))
 
 
 class DescendantNodeMappingTests(unittest.TestCase):
@@ -512,8 +540,8 @@ class DescendantNodeMappingTests(unittest.TestCase):
         self.assertEqual(Position.IP, spec.acting_player)
         self.assertEqual((Action(ActionKind.BET, 200),), spec.tree.action_history)
         self.assertEqual(200, spec.tree.facing_bet)
-        self.assertEqual("200c", spec.parameters.bet_sizes.turn.oop.bet)
-        self.assertEqual("200c", spec.parameters.bet_sizes.turn.ip.bet)
+        self.assertEqual("50%, 200c", spec.parameters.bet_sizes.turn.oop.bet)
+        self.assertEqual("50%, 200c", spec.parameters.bet_sizes.turn.ip.bet)
         self.assertEqual(
             {
                 Action(ActionKind.FOLD),
@@ -663,6 +691,7 @@ class SupportedMappingAndCacheTests(unittest.TestCase):
 
         self.assertEqual(live.LiveGTOStatus.SOLVED, fresh.status)
         self.assertEqual("GTO fresh", fresh.source)
+        self.assertFalse(fresh.approximate)
         self.assertFalse(fresh.cache_hit)
         self.assertEqual(live.LiveGTOStatus.SOLVED, cached.status)
         self.assertEqual("GTO cache", cached.source)
@@ -722,7 +751,14 @@ class SupportedMappingAndCacheTests(unittest.TestCase):
         hero_combo = WeightedCombo(state.hero_combo).cards
         seed = f"{state.hand_id}:{spec.cache_key}:{','.join(hero_combo)}"
         roll = Decimal(
-            int.from_bytes(hashlib.sha256(seed.encode("utf-8")).digest()[:8], "big")
+            int.from_bytes(
+                hmac.digest(
+                    self.config.mix_secret,
+                    seed.encode("utf-8"),
+                    "sha256",
+                )[:8],
+                "big",
+            )
         ) / Decimal(2**64)
         expected_action = "Bet" if roll < Decimal("0.75") else "Check"
         expected_size = "4.63 BB" if expected_action == "Bet" else "0"
@@ -820,6 +856,7 @@ class SupportedMappingAndCacheTests(unittest.TestCase):
 
         self.assertEqual(live.LiveGTOStatus.SOLVED, outcome.status)
         self.assertEqual("APPROXIMATE_SOLVER fresh", outcome.source)
+        self.assertTrue(outcome.approximate)
         self.assertIn("**Approximate solver mix:**", outcome.analysis)
         self.assertNotIn("**GTO mix:**", outcome.analysis)
 

@@ -1455,6 +1455,10 @@ class StrategyBackendIntegrationTests(unittest.TestCase):
         state.hand_id = "backend-integration"
         return state
 
+    def test_default_backend_is_strict_gto(self):
+        self.assertEqual("GTO", app.DEFAULT_STRATEGY_BACKEND)
+        self.assertIn("GTO_HU", app.VALID_STRATEGY_BACKENDS)
+
     def test_solved_gto_bypasses_claude_and_preserves_source_and_metrics(self):
         state = self.heads_up_state()
         history = app.HandHistory(snapshots=[state], hand_id=state.hand_id)
@@ -1547,6 +1551,124 @@ class StrategyBackendIntegrationTests(unittest.TestCase):
             json.loads(result.prompt)["backend"],
         )
         claude.messages.create.assert_not_called()
+
+    def test_gto_hu_accepts_labelled_approximation_without_claude(self):
+        state = self.heads_up_state()
+        history = app.HandHistory(snapshots=[state], hand_id=state.hand_id)
+        outcome = SimpleNamespace(
+            solved=True,
+            status=app.LiveGTOStatus.SOLVED,
+            reason="",
+            analysis=(
+                "**Action:** Check\n"
+                "**Size:** 0\n"
+                "**Why:** Approximate local solver mix."
+            ),
+            source="APPROXIMATE_SOLVER fresh",
+            approximate=True,
+            model="b-inary/postflop-solver",
+            spec=SimpleNamespace(cache_key="d" * 64),
+        )
+        router = mock.Mock()
+        router.evaluate.return_value = outcome
+        claude = mock.Mock()
+
+        with mock.patch.object(
+            app,
+            "evaluate_strategy_snapshot",
+            side_effect=AssertionError("GTO_HU must never invoke Claude"),
+        ) as evaluate_claude:
+            result = app.evaluate_strategy_backend(
+                state,
+                history,
+                mode="COACH",
+                backend="GTO_HU",
+                router=router,
+                client=claude,
+            )
+
+        evaluate_claude.assert_not_called()
+        claude.with_options.assert_not_called()
+        claude.messages.create.assert_not_called()
+        self.assertEqual("APPROXIMATE_SOLVER", result.mode)
+        self.assertEqual("APPROXIMATE_SOLVER fresh", result.source)
+        self.assertEqual(
+            "APPROXIMATE_SOLVER",
+            json.loads(result.prompt)["backend"],
+        )
+
+    def test_gto_hu_unsupported_node_does_not_fall_back_to_claude(self):
+        state = self.heads_up_state()
+        history = app.HandHistory(snapshots=[state], hand_id=state.hand_id)
+        outcome = SimpleNamespace(
+            solved=False,
+            status=app.LiveGTOStatus.UNSUPPORTED,
+            reason="the solver requires exactly one active villain",
+        )
+        router = mock.Mock()
+        router.evaluate.return_value = outcome
+
+        with mock.patch.object(
+            app,
+            "evaluate_strategy_snapshot",
+            side_effect=AssertionError("GTO_HU must never invoke Claude"),
+        ) as evaluate_claude:
+            result = app.evaluate_strategy_backend(
+                state,
+                history,
+                backend="GTO_HU",
+                router=router,
+            )
+
+        evaluate_claude.assert_not_called()
+        self.assertEqual("GTO_HU", result.mode)
+        self.assertIn("GTO_HU unsupported", result.error)
+
+    def test_strict_gto_rejects_approximate_result_without_calling_claude(self):
+        state = self.heads_up_state()
+        history = app.HandHistory(snapshots=[state], hand_id=state.hand_id)
+        outcome = SimpleNamespace(
+            solved=True,
+            status=app.LiveGTOStatus.SOLVED,
+            reason="",
+            analysis=(
+                "**Action:** Check\n"
+                "**Size:** 0\n"
+                "**Why:** Approximate local solver mix."
+            ),
+            source="APPROXIMATE_SOLVER fresh",
+            approximate=True,
+            model="b-inary/postflop-solver",
+            spec=SimpleNamespace(cache_key="c" * 64),
+        )
+        router = mock.Mock()
+        router.evaluate.return_value = outcome
+        claude = mock.Mock()
+
+        with mock.patch.object(
+            app,
+            "evaluate_strategy_snapshot",
+            side_effect=AssertionError("strict GTO must not invoke Claude"),
+        ) as evaluate_claude:
+            result = app.evaluate_strategy_backend(
+                state,
+                history,
+                mode="COACH",
+                backend="GTO",
+                router=router,
+                client=claude,
+            )
+
+        evaluate_claude.assert_not_called()
+        claude.with_options.assert_not_called()
+        claude.messages.create.assert_not_called()
+        self.assertEqual("GTO", result.mode)
+        self.assertEqual(
+            "GTO failed: strict GTO mode rejected an explicitly approximate "
+            "solver result",
+            result.error,
+        )
+        self.assertEqual(f"Strategy Error: {result.error}", result.final_analysis)
 
     def test_hybrid_unsupported_calls_claude_once_and_labels_fallback(self):
         state = self.heads_up_state()
@@ -1906,12 +2028,17 @@ class FlowFreshnessGateTests(unittest.TestCase):
     def setUp(self):
         self.original_history = app.current_history
         self.original_recorder = app.recorder
+        self.original_backend = app.STRATEGY_BACKEND
         app.current_history = app.HandHistory()
         app.recorder = None
+        # This class verifies the explicit Claude flow and must not inherit the
+        # process/user strategy backend.
+        app.STRATEGY_BACKEND = "CLAUDE"
 
     def tearDown(self):
         app.current_history = self.original_history
         app.recorder = self.original_recorder
+        app.STRATEGY_BACKEND = self.original_backend
 
     @staticmethod
     def captures():

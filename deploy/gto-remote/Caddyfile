@@ -1,0 +1,19 @@
+# Replace this hostname with the DNS name whose A/AAAA record points here.
+solver.example.com {
+	request_body {
+		max_size 256KB
+	}
+
+	reverse_proxy 127.0.0.1:8787 {
+		transport http {
+			dial_timeout 5s
+			response_header_timeout 10m
+		}
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		-Server
+	}
+}

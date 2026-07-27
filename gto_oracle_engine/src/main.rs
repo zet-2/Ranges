@@ -17,7 +17,9 @@ use std::time::Instant;
 
 const SOLVER_COMMIT: &str = "9d1509fe5077d019825f833eed04b16d342dfda1";
 const SCHEMA_VERSION: u32 = 1;
-const MAX_ESTIMATED_MEMORY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const DEFAULT_MAX_ESTIMATED_MEMORY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const MAX_CONFIGURED_MEMORY_GIB: u64 = 4_096;
+const MEMORY_LIMIT_ENV: &str = "GTO_ENGINE_MAX_MEMORY_GIB";
 const MAX_ITERATIONS: u32 = 1_000_000;
 const MAX_TEXT_FIELD_BYTES: usize = 65_536;
 const MAX_CHIP_UNITS: i32 = i32::MAX / 4;
@@ -81,11 +83,45 @@ struct SolveNodeRequest {
     expected_node_actions: Vec<WireAction>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SolvePathRequest {
+    schema_version: u32,
+    id: String,
+    operation: Operation,
+    offline_only_acknowledged: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    owned_simulator_acknowledged: bool,
+    street: Street,
+    board: Vec<String>,
+    oop_range: String,
+    ip_range: String,
+    starting_pot: i32,
+    effective_stack: i32,
+    chip_scale: u32,
+    chip_unit: String,
+    allocation_mode: AllocationMode,
+    #[serde(default)]
+    bet_sizes: BetSizes,
+    #[serde(default)]
+    rake: Rake,
+    tree_options: TreeOptions,
+    target_exploitability_pct: f64,
+    max_iterations: u32,
+    path_history: Vec<WirePathStep>,
+    expected_board: Vec<String>,
+    expected_total_invested: [i32; 2],
+    expected_current_player: NodePlayer,
+    expected_facing_bet: i32,
+    expected_node_actions: Vec<WireAction>,
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum Operation {
     SolveRoot,
     SolveNode,
+    SolvePath,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -136,6 +172,23 @@ struct WireAction {
     kind: WireActionKind,
     #[serde(deserialize_with = "deserialize_required_nullable_i32")]
     amount: Option<i32>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum WirePathStep {
+    Action {
+        action: WireAction,
+    },
+    Deal {
+        card: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ResolvedPathStep {
+    Action(Action),
+    Deal(u8),
 }
 
 fn deserialize_required_nullable_i32<'de, D>(deserializer: D) -> Result<Option<i32>, D::Error>
@@ -320,6 +373,25 @@ struct SolveNodeResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct SolvePathResponse {
+    schema_version: u32,
+    id: String,
+    operation: &'static str,
+    status: &'static str,
+    provenance: PathProvenance,
+    current_street: Street,
+    current_board: Vec<String>,
+    current_player: &'static str,
+    node_actions: Vec<ActionDescriptor>,
+    node_total_reachable_weight: f64,
+    policies: Vec<NodePolicy>,
+    conditional_ranges: Vec<ConditionalPlayerRange>,
+    convergence: Convergence,
+    memory: MemoryUsage,
+    timings_ms: Timings,
+}
+
+#[derive(Debug, Serialize)]
 struct SolverMetadata {
     name: &'static str,
     algorithm: &'static str,
@@ -345,6 +417,15 @@ struct NodeProvenance {
     #[serde(skip_serializing_if = "is_false")]
     owned_simulator_acknowledged: bool,
     effective_request: EffectiveNodeRequest,
+}
+
+#[derive(Debug, Serialize)]
+struct PathProvenance {
+    solver: SolverMetadata,
+    offline_only_acknowledged: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    owned_simulator_acknowledged: bool,
+    effective_request: EffectivePathRequest,
 }
 
 #[derive(Debug, Serialize)]
@@ -382,6 +463,30 @@ struct EffectiveNodeRequest {
     target_exploitability_pct: f64,
     max_iterations: u32,
     action_history: Vec<WireAction>,
+    expected_current_player: NodePlayer,
+    expected_facing_bet: i32,
+    expected_node_actions: Vec<WireAction>,
+}
+
+#[derive(Debug, Serialize)]
+struct EffectivePathRequest {
+    street: Street,
+    board: Vec<String>,
+    oop_range: String,
+    ip_range: String,
+    starting_pot: i32,
+    effective_stack: i32,
+    chip_scale: u32,
+    chip_unit: String,
+    allocation_mode: AllocationMode,
+    bet_sizes: BetSizes,
+    rake: Rake,
+    tree_options: TreeOptions,
+    target_exploitability_pct: f64,
+    max_iterations: u32,
+    path_history: Vec<WirePathStep>,
+    expected_board: Vec<String>,
+    expected_total_invested: [i32; 2],
     expected_current_player: NodePlayer,
     expected_facing_bet: i32,
     expected_node_actions: Vec<WireAction>,
@@ -427,6 +532,22 @@ struct NodePolicy {
     equilibrium_ev_units: f64,
     node_action_frequencies: Vec<f64>,
     node_action_evs_units: Vec<f64>,
+}
+
+#[derive(Debug, Serialize)]
+struct ConditionalPlayerRange {
+    player: &'static str,
+    total_joint_compatible_weight: f64,
+    combos: Vec<ConditionalComboWeight>,
+}
+
+#[derive(Debug, Serialize)]
+struct ConditionalComboWeight {
+    hand: String,
+    input_range_weight: f64,
+    path_weight: f64,
+    joint_compatible_weight: f64,
+    conditional_reach_weight: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -498,6 +619,38 @@ impl OracleError {
     }
 }
 
+fn memory_limit_bytes_from_value(value: Option<&str>) -> Result<u64, OracleError> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_MAX_ESTIMATED_MEMORY_BYTES);
+    };
+    let gib = value.trim().parse::<u64>().map_err(|_| {
+        OracleError::validation(format!(
+            "{MEMORY_LIMIT_ENV} must be a positive integer number of GiB"
+        ))
+    })?;
+    if !(1..=MAX_CONFIGURED_MEMORY_GIB).contains(&gib) {
+        return Err(OracleError::validation(format!(
+            "{MEMORY_LIMIT_ENV} must be between 1 and {MAX_CONFIGURED_MEMORY_GIB}"
+        )));
+    }
+    gib.checked_mul(1024 * 1024 * 1024).ok_or_else(|| {
+        OracleError::validation(format!("{MEMORY_LIMIT_ENV} is too large"))
+    })
+}
+
+fn configured_memory_limit_bytes() -> Result<u64, OracleError> {
+    let raw_value = std::env::var_os(MEMORY_LIMIT_ENV);
+    let value = raw_value
+        .as_deref()
+        .map(|raw| {
+            raw.to_str().ok_or_else(|| {
+                OracleError::validation(format!("{MEMORY_LIMIT_ENV} must be valid UTF-8"))
+            })
+        })
+        .transpose()?;
+    memory_limit_bytes_from_value(value)
+}
+
 fn main() -> ExitCode {
     let mut input = String::new();
     if let Err(error) = io::stdin().read_to_string(&mut input) {
@@ -518,8 +671,10 @@ fn main() -> ExitCode {
         .as_ref()
         .and_then(|value| value.get("operation").and_then(|operation| operation.as_str()));
 
-    if operation == Some("solve_node") {
-        return run_node_request(&input, fallback_id);
+    match operation {
+        Some("solve_node") => return run_node_request(&input, fallback_id),
+        Some("solve_path") => return run_path_request(&input, fallback_id),
+        _ => {}
     }
 
     run_root_request(&input, fallback_id)
@@ -614,6 +769,54 @@ fn run_node_request(input: &str, fallback_id: Option<String>) -> ExitCode {
     }
 }
 
+fn run_path_request(input: &str, fallback_id: Option<String>) -> ExitCode {
+    let request: SolvePathRequest = match serde_json::from_str(input) {
+        Ok(request) => request,
+        Err(error) => {
+            write_error_for_operation(
+                "solve_path",
+                fallback_id,
+                "INVALID_REQUEST",
+                format!("request does not match the strict schema: {error}"),
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let id = request.id.clone();
+    let result = catch_unwind(AssertUnwindSafe(|| solve_path(request)));
+    match result {
+        Ok(Ok(response)) => match serde_json::to_string(&response) {
+            Ok(json) => {
+                println!("{json}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                write_error_for_operation(
+                    "solve_path",
+                    Some(id),
+                    "SERIALIZATION_ERROR",
+                    error.to_string(),
+                );
+                ExitCode::FAILURE
+            }
+        },
+        Ok(Err(error)) => {
+            write_error_for_operation("solve_path", Some(id), error.code, error.message);
+            ExitCode::FAILURE
+        }
+        Err(_) => {
+            write_error_for_operation(
+                "solve_path",
+                Some(id),
+                "INTERNAL_PANIC",
+                "the solver aborted while processing the request".to_string(),
+            );
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn write_error(id: Option<String>, code: &'static str, message: String) {
     write_error_for_operation("solve_root", id, code, message);
 }
@@ -647,6 +850,7 @@ fn write_error_for_operation(
 fn solve_root(request: SolveRootRequest) -> Result<SolveRootResponse, OracleError> {
     let total_started = Instant::now();
     validate_request(&request)?;
+    let memory_limit_bytes = configured_memory_limit_bytes()?;
 
     let board_cards = parse_board(&request.street, &request.board)?;
     validate_range_weights("oop_range", &request.oop_range)?;
@@ -708,11 +912,11 @@ fn solve_root(request: SolveRootRequest) -> Result<SolveRootResponse, OracleErro
     } else {
         uncompressed_bytes
     };
-    if selected_memory_bytes > MAX_ESTIMATED_MEMORY_BYTES {
+    if selected_memory_bytes > memory_limit_bytes {
         return Err(OracleError {
             code: "MEMORY_LIMIT",
             message: format!(
-                "estimated {} tree size is {selected_memory_bytes} bytes; hard limit is {MAX_ESTIMATED_MEMORY_BYTES} bytes",
+                "estimated {} tree size is {selected_memory_bytes} bytes; configured hard limit is {memory_limit_bytes} bytes",
                 request.allocation_mode.as_str()
             ),
         });
@@ -762,9 +966,9 @@ fn solve_root(request: SolveRootRequest) -> Result<SolveRootResponse, OracleErro
                 name: "b-inary/postflop-solver",
                 algorithm: "Discounted CFR",
                 commit: SOLVER_COMMIT,
-                abstraction: "none (suit isomorphism only)",
+                abstraction: "card-exact; caller-supplied discrete action tree",
                 allocation_mode: request.allocation_mode.as_str(),
-                memory_hard_limit_bytes: MAX_ESTIMATED_MEMORY_BYTES,
+                memory_hard_limit_bytes: memory_limit_bytes,
             },
             offline_only_acknowledged: request.offline_only_acknowledged,
             owned_simulator_acknowledged: request.owned_simulator_acknowledged,
@@ -803,7 +1007,7 @@ fn solve_root(request: SolveRootRequest) -> Result<SolveRootResponse, OracleErro
             estimated_uncompressed_bytes: uncompressed_bytes,
             estimated_compressed_bytes: compressed_bytes,
             allocation_mode: request.allocation_mode.as_str(),
-            hard_limit_bytes: MAX_ESTIMATED_MEMORY_BYTES,
+            hard_limit_bytes: memory_limit_bytes,
         },
         timings_ms: Timings {
             tree_build: tree_build_ms,
@@ -818,6 +1022,7 @@ fn solve_root(request: SolveRootRequest) -> Result<SolveRootResponse, OracleErro
 fn solve_node(request: SolveNodeRequest) -> Result<SolveNodeResponse, OracleError> {
     let total_started = Instant::now();
     let (history, expected_node_actions) = validate_node_request(&request)?;
+    let memory_limit_bytes = configured_memory_limit_bytes()?;
 
     let board_cards = parse_board(&request.street, &request.board)?;
     validate_range_weights("oop_range", &request.oop_range)?;
@@ -879,11 +1084,11 @@ fn solve_node(request: SolveNodeRequest) -> Result<SolveNodeResponse, OracleErro
     } else {
         uncompressed_bytes
     };
-    if selected_memory_bytes > MAX_ESTIMATED_MEMORY_BYTES {
+    if selected_memory_bytes > memory_limit_bytes {
         return Err(OracleError {
             code: "MEMORY_LIMIT",
             message: format!(
-                "estimated {} tree size is {selected_memory_bytes} bytes; hard limit is {MAX_ESTIMATED_MEMORY_BYTES} bytes",
+                "estimated {} tree size is {selected_memory_bytes} bytes; configured hard limit is {memory_limit_bytes} bytes",
                 request.allocation_mode.as_str()
             ),
         });
@@ -981,9 +1186,9 @@ fn solve_node(request: SolveNodeRequest) -> Result<SolveNodeResponse, OracleErro
                 name: "b-inary/postflop-solver",
                 algorithm: "Discounted CFR",
                 commit: SOLVER_COMMIT,
-                abstraction: "none (suit isomorphism only)",
+                abstraction: "card-exact; caller-supplied discrete action tree",
                 allocation_mode: request.allocation_mode.as_str(),
-                memory_hard_limit_bytes: MAX_ESTIMATED_MEMORY_BYTES,
+                memory_hard_limit_bytes: memory_limit_bytes,
             },
             offline_only_acknowledged: request.offline_only_acknowledged,
             owned_simulator_acknowledged: request.owned_simulator_acknowledged,
@@ -1027,7 +1232,7 @@ fn solve_node(request: SolveNodeRequest) -> Result<SolveNodeResponse, OracleErro
             estimated_uncompressed_bytes: uncompressed_bytes,
             estimated_compressed_bytes: compressed_bytes,
             allocation_mode: request.allocation_mode.as_str(),
-            hard_limit_bytes: MAX_ESTIMATED_MEMORY_BYTES,
+            hard_limit_bytes: memory_limit_bytes,
         },
         timings_ms: Timings {
             tree_build: tree_build_ms,
@@ -1037,6 +1242,526 @@ fn solve_node(request: SolveNodeRequest) -> Result<SolveNodeResponse, OracleErro
             total: elapsed_ms(total_started),
         },
     })
+}
+
+fn solve_path(request: SolvePathRequest) -> Result<SolvePathResponse, OracleError> {
+    let total_started = Instant::now();
+    let (path, expected_node_actions) = validate_path_request(&request)?;
+    let memory_limit_bytes = configured_memory_limit_bytes()?;
+
+    let board_cards = parse_board(&request.street, &request.board)?;
+    validate_range_weights("oop_range", &request.oop_range)?;
+    validate_range_weights("ip_range", &request.ip_range)?;
+    let oop_range = request
+        .oop_range
+        .parse()
+        .map_err(|error: String| OracleError::validation(format!("invalid oop_range: {error}")))?;
+    let ip_range = request
+        .ip_range
+        .parse()
+        .map_err(|error: String| OracleError::validation(format!("invalid ip_range: {error}")))?;
+    let parsed_sizes = parse_bet_sizes(&request.bet_sizes)?;
+    let turn_donk_sizes = parse_donk_sizes(
+        "turn",
+        request.tree_options.turn_donk_sizes.as_deref(),
+    )?;
+    let river_donk_sizes = parse_donk_sizes(
+        "river",
+        request.tree_options.river_donk_sizes.as_deref(),
+    )?;
+
+    let tree_started = Instant::now();
+    let card_config = CardConfig {
+        range: [oop_range, ip_range],
+        flop: [board_cards[0], board_cards[1], board_cards[2]],
+        // A continuation solve must not know future public cards at the flop
+        // root. Turn and river are traversed explicitly as chance steps.
+        turn: NOT_DEALT,
+        river: NOT_DEALT,
+    };
+    let tree_config = TreeConfig {
+        initial_state: BoardState::Flop,
+        starting_pot: request.starting_pot,
+        effective_stack: request.effective_stack,
+        rake_rate: request.rake.rate_pct / 100.0,
+        rake_cap: request.rake.cap,
+        flop_bet_sizes: parsed_sizes[0].clone(),
+        turn_bet_sizes: parsed_sizes[1].clone(),
+        river_bet_sizes: parsed_sizes[2].clone(),
+        turn_donk_sizes,
+        river_donk_sizes,
+        add_allin_threshold: request.tree_options.add_allin_threshold,
+        force_allin_threshold: request.tree_options.force_allin_threshold,
+        merging_threshold: request.tree_options.merging_threshold,
+    };
+    let mut action_tree = ActionTree::new(tree_config).map_err(OracleError::solver)?;
+    add_observed_path_actions(&mut action_tree, &path)?;
+    action_tree.back_to_root();
+    let mut game = PostFlopGame::with_config(card_config, action_tree)
+        .map_err(|error| OracleError::solver(format!("failed to build game: {error}")))?;
+    let tree_build_ms = elapsed_ms(tree_started);
+
+    if game.private_cards(0).is_empty() || game.private_cards(1).is_empty() {
+        return Err(OracleError::validation(
+            "both ranges must contain at least one combo compatible with the flop",
+        ));
+    }
+
+    let (uncompressed_bytes, compressed_bytes) = game.memory_usage();
+    let selected_memory_bytes = if request.allocation_mode.is_compressed() {
+        compressed_bytes
+    } else {
+        uncompressed_bytes
+    };
+    if selected_memory_bytes > memory_limit_bytes {
+        return Err(OracleError {
+            code: "MEMORY_LIMIT",
+            message: format!(
+                "estimated {} tree size is {selected_memory_bytes} bytes; configured hard limit is {memory_limit_bytes} bytes",
+                request.allocation_mode.as_str()
+            ),
+        });
+    }
+
+    let allocation_started = Instant::now();
+    game.allocate_memory(request.allocation_mode.is_compressed());
+    let allocation_ms = elapsed_ms(allocation_started);
+
+    let target_fraction = (request.target_exploitability_pct / 100.0) as f32;
+    let target_units = request.starting_pot as f32 * target_fraction;
+    let solve_started = Instant::now();
+    let (iterations, exploitability) =
+        run_solver(&mut game, request.max_iterations, target_units);
+    let solve_ms = elapsed_ms(solve_started);
+
+    let extraction_started = Instant::now();
+    let input_range_weights = [game.weights(0).to_vec(), game.weights(1).to_vec()];
+    traverse_full_path(&mut game, &path)?;
+
+    if game.is_terminal_node() {
+        return Err(OracleError {
+            code: "NODE_PATH_ERROR",
+            message: "path_history ends at a terminal node".to_string(),
+        });
+    }
+    if game.is_chance_node() {
+        return Err(OracleError {
+            code: "NODE_PATH_ERROR",
+            message: "path_history stops before a required board card".to_string(),
+        });
+    }
+
+    let current_board = game
+        .current_board()
+        .into_iter()
+        .map(card_to_text)
+        .collect::<Vec<_>>();
+    if current_board != request.expected_board {
+        return Err(OracleError {
+            code: "NODE_MISMATCH",
+            message: format!(
+                "current board mismatch: expected {:?}, solver reached {:?}",
+                request.expected_board, current_board
+            ),
+        });
+    }
+
+    let current_player = game.current_player();
+    if current_player != request.expected_current_player.index() {
+        return Err(OracleError {
+            code: "NODE_MISMATCH",
+            message: format!(
+                "current player mismatch: expected {}, solver reached {}",
+                request.expected_current_player.as_str(),
+                player_name(current_player)
+            ),
+        });
+    }
+
+    let total_bet_amount = game.total_bet_amount();
+    if total_bet_amount != request.expected_total_invested {
+        return Err(OracleError {
+            code: "NODE_MISMATCH",
+            message: format!(
+                "total postflop investment mismatch: expected {:?}, solver reached {:?}",
+                request.expected_total_invested, total_bet_amount
+            ),
+        });
+    }
+    let facing_bet = total_bet_amount[current_player ^ 1]
+        .checked_sub(total_bet_amount[current_player])
+        .ok_or_else(|| OracleError {
+            code: "NODE_MISMATCH",
+            message: "current player has invested more than the opponent".to_string(),
+        })?;
+    if facing_bet != request.expected_facing_bet {
+        return Err(OracleError {
+            code: "NODE_MISMATCH",
+            message: format!(
+                "facing bet mismatch: expected {}, solver reached {facing_bet}",
+                request.expected_facing_bet
+            ),
+        });
+    }
+
+    let node_actions = game.available_actions();
+    if !same_action_set(&node_actions, &expected_node_actions) {
+        return Err(OracleError {
+            code: "NODE_MISMATCH",
+            message: format!(
+                "node actions mismatch: expected {expected_node_actions:?}, solver reached {node_actions:?}"
+            ),
+        });
+    }
+    let action_descriptors = node_actions
+        .iter()
+        .enumerate()
+        .map(|(index, action)| describe_action(index, *action))
+        .collect::<Vec<_>>();
+
+    game.cache_normalized_weights();
+    let (node_total_reachable_weight, policies) = extract_node_policies(
+        &game,
+        current_player,
+        &input_range_weights[current_player],
+        node_actions.len(),
+    )?;
+    let conditional_ranges = vec![
+        extract_conditional_range(&game, 0, &input_range_weights[0])?,
+        extract_conditional_range(&game, 1, &input_range_weights[1])?,
+    ];
+    let extraction_ms = elapsed_ms(extraction_started);
+
+    let current_street = match current_board.len() {
+        3 => Street::Flop,
+        4 => Street::Turn,
+        5 => Street::River,
+        _ => {
+            return Err(OracleError::solver(
+                "solver returned an impossible current-board length",
+            ))
+        }
+    };
+    let exploitability_pct = 100.0 * exploitability as f64 / request.starting_pot as f64;
+    Ok(SolvePathResponse {
+        schema_version: SCHEMA_VERSION,
+        id: request.id,
+        operation: "solve_path",
+        status: "ok",
+        provenance: PathProvenance {
+            solver: SolverMetadata {
+                name: "b-inary/postflop-solver",
+                algorithm: "Discounted CFR",
+                commit: SOLVER_COMMIT,
+                abstraction: "card-exact; caller-supplied discrete action tree",
+                allocation_mode: request.allocation_mode.as_str(),
+                memory_hard_limit_bytes: memory_limit_bytes,
+            },
+            offline_only_acknowledged: request.offline_only_acknowledged,
+            owned_simulator_acknowledged: request.owned_simulator_acknowledged,
+            effective_request: EffectivePathRequest {
+                street: request.street,
+                board: request.board.clone(),
+                oop_range: request.oop_range.clone(),
+                ip_range: request.ip_range.clone(),
+                starting_pot: request.starting_pot,
+                effective_stack: request.effective_stack,
+                chip_scale: request.chip_scale,
+                chip_unit: request.chip_unit.clone(),
+                allocation_mode: request.allocation_mode,
+                bet_sizes: request.bet_sizes.clone(),
+                rake: request.rake.clone(),
+                tree_options: request.tree_options.clone(),
+                target_exploitability_pct: request.target_exploitability_pct,
+                max_iterations: request.max_iterations,
+                path_history: request.path_history.clone(),
+                expected_board: request.expected_board.clone(),
+                expected_total_invested: request.expected_total_invested,
+                expected_current_player: request.expected_current_player,
+                expected_facing_bet: request.expected_facing_bet,
+                expected_node_actions: request.expected_node_actions.clone(),
+            },
+        },
+        current_street,
+        current_board,
+        current_player: player_name(current_player),
+        node_actions: action_descriptors,
+        node_total_reachable_weight,
+        policies,
+        conditional_ranges,
+        convergence: Convergence {
+            iterations,
+            max_iterations: request.max_iterations,
+            target_exploitability_pct: request.target_exploitability_pct,
+            target_exploitability_units: target_units as f64,
+            exploitability_pct_of_pot: exploitability_pct,
+            exploitability_units: exploitability as f64,
+            target_reached: exploitability <= target_units,
+        },
+        memory: MemoryUsage {
+            estimated_uncompressed_bytes: uncompressed_bytes,
+            estimated_compressed_bytes: compressed_bytes,
+            allocation_mode: request.allocation_mode.as_str(),
+            hard_limit_bytes: memory_limit_bytes,
+        },
+        timings_ms: Timings {
+            tree_build: tree_build_ms,
+            allocation: allocation_ms,
+            solve: solve_ms,
+            extraction: extraction_ms,
+            total: elapsed_ms(total_started),
+        },
+    })
+}
+
+fn validate_path_request(
+    request: &SolvePathRequest,
+) -> Result<(Vec<ResolvedPathStep>, Vec<Action>), OracleError> {
+    if request.operation != Operation::SolvePath {
+        return Err(OracleError::validation("operation must be solve_path"));
+    }
+    if request.street != Street::Flop {
+        return Err(OracleError::validation(
+            "solve_path must begin from the FLOP root",
+        ));
+    }
+
+    let root_equivalent = SolveRootRequest {
+        schema_version: request.schema_version,
+        id: request.id.clone(),
+        operation: Operation::SolveRoot,
+        offline_only_acknowledged: request.offline_only_acknowledged,
+        owned_simulator_acknowledged: request.owned_simulator_acknowledged,
+        street: request.street,
+        board: request.board.clone(),
+        oop_range: request.oop_range.clone(),
+        ip_range: request.ip_range.clone(),
+        starting_pot: request.starting_pot,
+        effective_stack: request.effective_stack,
+        chip_scale: request.chip_scale,
+        chip_unit: request.chip_unit.clone(),
+        allocation_mode: request.allocation_mode,
+        bet_sizes: request.bet_sizes.clone(),
+        rake: request.rake.clone(),
+        tree_options: request.tree_options.clone(),
+        target_exploitability_pct: request.target_exploitability_pct,
+        max_iterations: request.max_iterations,
+    };
+    validate_request(&root_equivalent)?;
+
+    if request.path_history.len() > 256 {
+        return Err(OracleError::validation(
+            "path_history cannot exceed 256 steps",
+        ));
+    }
+    if !(3..=5).contains(&request.expected_board.len()) {
+        return Err(OracleError::validation(
+            "expected_board must contain 3, 4, or 5 cards",
+        ));
+    }
+    let current_street = match request.expected_board.len() {
+        3 => Street::Flop,
+        4 => Street::Turn,
+        5 => Street::River,
+        _ => unreachable!(),
+    };
+    parse_board(&current_street, &request.expected_board)?;
+    if request.expected_board[..3] != request.board {
+        return Err(OracleError::validation(
+            "expected_board must preserve the request flop",
+        ));
+    }
+
+    let mut path = Vec::with_capacity(request.path_history.len());
+    let mut dealt_cards = Vec::new();
+    for (index, step) in request.path_history.iter().enumerate() {
+        match step {
+            WirePathStep::Action { action } => {
+                path.push(ResolvedPathStep::Action(action.to_solver_action(
+                    &format!("path_history[{index}].action"),
+                    request.effective_stack,
+                )?));
+            }
+            WirePathStep::Deal { card } => {
+                let parsed = card_from_str(card).map_err(|error| {
+                    OracleError::validation(format!(
+                        "path_history[{index}].card is invalid: {error}"
+                    ))
+                })?;
+                dealt_cards.push(card.clone());
+                path.push(ResolvedPathStep::Deal(parsed));
+            }
+        }
+    }
+    if dealt_cards != request.expected_board[3..] {
+        return Err(OracleError::validation(
+            "path deal cards must exactly equal expected_board after the flop",
+        ));
+    }
+
+    if request.expected_total_invested.iter().any(|&value| {
+        value < 0 || value > request.effective_stack
+    }) {
+        return Err(OracleError::validation(format!(
+            "expected_total_invested values must be in [0, {}]",
+            request.effective_stack
+        )));
+    }
+    let actor = request.expected_current_player.index();
+    let implied_facing = request.expected_total_invested[actor ^ 1]
+        .checked_sub(request.expected_total_invested[actor])
+        .ok_or_else(|| {
+            OracleError::validation(
+                "expected current player cannot have invested more than the opponent",
+            )
+        })?;
+    if request.expected_facing_bet != implied_facing {
+        return Err(OracleError::validation(format!(
+            "expected_facing_bet must equal the investment difference {implied_facing}"
+        )));
+    }
+    if request.expected_node_actions.is_empty() {
+        return Err(OracleError::validation(
+            "expected_node_actions cannot be empty",
+        ));
+    }
+    let expected_actions = request
+        .expected_node_actions
+        .iter()
+        .enumerate()
+        .map(|(index, action)| {
+            action.to_solver_action(
+                &format!("expected_node_actions[{index}]"),
+                request.effective_stack,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut unique_actions = expected_actions.clone();
+    unique_actions.sort_unstable();
+    unique_actions.dedup();
+    if unique_actions.len() != expected_actions.len() {
+        return Err(OracleError::validation(
+            "expected_node_actions cannot contain duplicates",
+        ));
+    }
+
+    Ok((path, expected_actions))
+}
+
+fn add_observed_path_actions(
+    tree: &mut ActionTree,
+    path: &[ResolvedPathStep],
+) -> Result<(), OracleError> {
+    for (step, item) in path.iter().enumerate() {
+        match item {
+            ResolvedPathStep::Deal(_) => {
+                // ActionTree intentionally abstracts chance cards. The actual
+                // PostFlopGame traversal below validates the exact deal order.
+            }
+            ResolvedPathStep::Action(action) => {
+                if tree.is_terminal_node() {
+                    return Err(OracleError {
+                        code: "NODE_PATH_ERROR",
+                        message: format!(
+                            "path_history[{step}] follows a terminal action-tree node"
+                        ),
+                    });
+                }
+                if !tree.available_actions().contains(action) {
+                    if !matches!(
+                        action,
+                        Action::Bet(_) | Action::Raise(_) | Action::AllIn(_)
+                    ) {
+                        return Err(OracleError {
+                            code: "NODE_PATH_ERROR",
+                            message: format!(
+                                "path_history[{step}] {action:?} is unavailable in the action tree"
+                            ),
+                        });
+                    }
+                    tree.add_action(*action).map_err(|error| OracleError {
+                        code: "NODE_PATH_ERROR",
+                        message: format!(
+                            "cannot add exact observed action at path_history[{step}]: {error}"
+                        ),
+                    })?;
+                }
+                tree.play(*action).map_err(|error| OracleError {
+                    code: "NODE_PATH_ERROR",
+                    message: format!(
+                        "cannot traverse action tree at path_history[{step}]: {error}"
+                    ),
+                })?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn traverse_full_path(
+    game: &mut PostFlopGame,
+    path: &[ResolvedPathStep],
+) -> Result<(), OracleError> {
+    for (step, item) in path.iter().enumerate() {
+        if game.is_terminal_node() {
+            return Err(OracleError {
+                code: "NODE_PATH_ERROR",
+                message: format!("path_history[{step}] follows a terminal node"),
+            });
+        }
+        match item {
+            ResolvedPathStep::Deal(card) => {
+                if !game.is_chance_node() {
+                    return Err(OracleError {
+                        code: "NODE_PATH_ERROR",
+                        message: format!(
+                            "path_history[{step}] deals a card before the betting round closed"
+                        ),
+                    });
+                }
+                if game.possible_cards() & (1u64 << *card) == 0 {
+                    return Err(OracleError {
+                        code: "NODE_PATH_ERROR",
+                        message: format!(
+                            "path_history[{step}] deal {} is unavailable",
+                            card_to_text(*card)
+                        ),
+                    });
+                }
+                game.play(*card as usize);
+            }
+            ResolvedPathStep::Action(requested_action) => {
+                if game.is_chance_node() {
+                    return Err(OracleError {
+                        code: "NODE_PATH_ERROR",
+                        message: format!(
+                            "path_history[{step}] omits the required turn or river card"
+                        ),
+                    });
+                }
+                let available_actions = game.available_actions();
+                let action_index = available_actions
+                    .iter()
+                    .position(|action| action == requested_action)
+                    .ok_or_else(|| OracleError {
+                        code: "NODE_PATH_ERROR",
+                        message: format!(
+                            "path_history[{step}] {requested_action:?} is unavailable; exact actions are {available_actions:?}"
+                        ),
+                    })?;
+                game.play(action_index);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn card_to_text(card: u8) -> String {
+    const RANKS: &[u8; 13] = b"23456789TJQKA";
+    const SUITS: &[u8; 4] = b"cdhs";
+    let rank = RANKS[(card / 4) as usize] as char;
+    let suit = SUITS[(card & 3) as usize] as char;
+    format!("{rank}{suit}")
 }
 
 fn validate_node_request(
@@ -1258,6 +1983,62 @@ fn extract_node_policies(
     }
 
     Ok((total_reachable_weight, policies))
+}
+
+fn extract_conditional_range(
+    game: &PostFlopGame,
+    player: usize,
+    input_range_weights: &[f32],
+) -> Result<ConditionalPlayerRange, OracleError> {
+    let cards = game.private_cards(player);
+    let path_weights = game.weights(player);
+    let joint_weights = game.normalized_weights(player);
+    if input_range_weights.len() != cards.len()
+        || path_weights.len() != cards.len()
+        || joint_weights.len() != cards.len()
+    {
+        return Err(OracleError::solver(
+            "solver returned inconsistent conditional-range vector lengths",
+        ));
+    }
+    let total_joint_compatible_weight = joint_weights
+        .iter()
+        .filter(|weight| **weight > 0.0)
+        .map(|weight| *weight as f64)
+        .sum::<f64>();
+    if total_joint_compatible_weight <= 0.0
+        || !total_joint_compatible_weight.is_finite()
+    {
+        return Err(OracleError {
+            code: "UNREACHABLE_NODE",
+            message: format!(
+                "{} has no positive conditional range at this node",
+                player_name(player)
+            ),
+        });
+    }
+
+    let mut combos = Vec::new();
+    for index in 0..cards.len() {
+        let joint_weight = joint_weights[index] as f64;
+        if joint_weight <= 0.0 {
+            continue;
+        }
+        let hand = hole_to_string(cards[index])
+            .map_err(|error| OracleError::solver(format!("failed to format combo: {error}")))?;
+        combos.push(ConditionalComboWeight {
+            hand,
+            input_range_weight: input_range_weights[index] as f64,
+            path_weight: path_weights[index] as f64,
+            joint_compatible_weight: joint_weight,
+            conditional_reach_weight: joint_weight / total_joint_compatible_weight,
+        });
+    }
+    Ok(ConditionalPlayerRange {
+        player: player_name(player),
+        total_joint_compatible_weight,
+        combos,
+    })
 }
 
 fn validate_request(request: &SolveRootRequest) -> Result<(), OracleError> {
@@ -1711,6 +2492,23 @@ fn elapsed_ms(started: Instant) -> f64 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn memory_limit_defaults_safely_and_accepts_explicit_hardware_capacity() {
+        assert_eq!(
+            memory_limit_bytes_from_value(None).unwrap(),
+            8 * 1024 * 1024 * 1024
+        );
+        assert_eq!(
+            memory_limit_bytes_from_value(Some("128")).unwrap(),
+            128 * 1024 * 1024 * 1024
+        );
+        for invalid in ["", "0", "-1", "1.5", "4097", "many"] {
+            let error = memory_limit_bytes_from_value(Some(invalid)).unwrap_err();
+            assert_eq!(error.code, "VALIDATION_ERROR");
+            assert!(error.message.contains(MEMORY_LIMIT_ENV));
+        }
+    }
+
     fn minimal_request() -> SolveRootRequest {
         SolveRootRequest {
             schema_version: SCHEMA_VERSION,
@@ -1781,6 +2579,70 @@ mod tests {
         }
     }
 
+    fn minimal_path_request() -> SolvePathRequest {
+        let sizes = BetSizes::default();
+        SolvePathRequest {
+            schema_version: SCHEMA_VERSION,
+            id: "test-flop-turn-path".to_string(),
+            operation: Operation::SolvePath,
+            offline_only_acknowledged: true,
+            owned_simulator_acknowledged: false,
+            street: Street::Flop,
+            board: vec!["2c", "7d", "Jh"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            oop_range: "QcQd,9c9d:0.5".to_string(),
+            // AsAd must be present at the flop root and disappear only after
+            // the exact As chance step is traversed.
+            ip_range: "AsAd:0.5,KcKd,TcTd:0.5".to_string(),
+            starting_pot: 550,
+            effective_stack: 9750,
+            chip_scale: 100,
+            chip_unit: "centi-BB".to_string(),
+            allocation_mode: AllocationMode::UncompressedF32,
+            bet_sizes: sizes,
+            rake: Rake {
+                rate_pct: 5.0,
+                cap: 50.0,
+            },
+            tree_options: TreeOptions {
+                add_allin_threshold: 0.0,
+                force_allin_threshold: 0.0,
+                merging_threshold: 0.0,
+                turn_donk_sizes: None,
+                river_donk_sizes: None,
+            },
+            target_exploitability_pct: 100.0,
+            max_iterations: 10,
+            path_history: vec![
+                WirePathStep::Action {
+                    action: wire_action(WireActionKind::Check, None),
+                },
+                WirePathStep::Action {
+                    action: wire_action(WireActionKind::Bet, Some(300)),
+                },
+                WirePathStep::Action {
+                    action: wire_action(WireActionKind::Call, None),
+                },
+                WirePathStep::Deal {
+                    card: "As".to_string(),
+                },
+            ],
+            expected_board: vec!["2c", "7d", "Jh", "As"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            expected_total_invested: [300, 300],
+            expected_current_player: NodePlayer::Oop,
+            expected_facing_bet: 0,
+            expected_node_actions: vec![
+                wire_action(WireActionKind::Check, None),
+                wire_action(WireActionKind::Bet, Some(575)),
+            ],
+        }
+    }
+
     #[test]
     fn strict_schema_rejects_unknown_fields() {
         let json = r#"{
@@ -1810,6 +2672,15 @@ mod tests {
         let payload = serde_json::to_string(&value).unwrap();
         let error = serde_json::from_str::<SolveNodeRequest>(&payload).unwrap_err();
         assert!(error.to_string().contains("missing field `amount`"));
+    }
+
+    #[test]
+    fn solve_path_wire_steps_reject_unknown_fields() {
+        let mut value = serde_json::to_value(minimal_path_request()).unwrap();
+        value["path_history"][0]["surprise"] = serde_json::Value::Bool(true);
+        let payload = serde_json::to_string(&value).unwrap();
+        let error = serde_json::from_str::<SolvePathRequest>(&payload).unwrap_err();
+        assert!(error.to_string().contains("unknown field"));
     }
 
     #[test]
@@ -2093,6 +2964,53 @@ mod tests {
             json["provenance"]["effective_request"]["expected_current_player"],
             "IP"
         );
+    }
+
+    #[test]
+    fn solve_path_conditions_ranges_across_a_real_turn_card() {
+        let response = solve_path(minimal_path_request()).unwrap();
+        assert_eq!(response.schema_version, SCHEMA_VERSION);
+        assert_eq!(response.operation, "solve_path");
+        assert_eq!(response.current_street, Street::Turn);
+        assert_eq!(
+            response.current_board,
+            vec!["2c", "7d", "Jh", "As"]
+        );
+        assert_eq!(response.current_player, "OOP");
+        assert_eq!(response.node_actions.len(), 2);
+        assert_eq!(response.node_actions[0].kind, "CHECK");
+        assert_eq!(response.node_actions[1].kind, "BET");
+        assert_eq!(response.node_actions[1].amount, Some(575));
+        assert_eq!(response.policies.len(), 2);
+        assert!(response
+            .policies
+            .iter()
+            .any(|policy| policy.hand.contains("Qc") && policy.hand.contains("Qd")));
+
+        let ip = response
+            .conditional_ranges
+            .iter()
+            .find(|range| range.player == "IP")
+            .expect("IP conditional range");
+        assert_eq!(ip.combos.len(), 2);
+        assert!(ip
+            .combos
+            .iter()
+            .any(|combo| combo.hand.contains("Kc") && combo.hand.contains("Kd")));
+        assert!(ip
+            .combos
+            .iter()
+            .any(|combo| combo.hand.contains("Tc") && combo.hand.contains("Td")));
+        assert!(!ip
+            .combos
+            .iter()
+            .any(|combo| combo.hand.contains("As") && combo.hand.contains("Ad")));
+        let reach_sum = ip
+            .combos
+            .iter()
+            .map(|combo| combo.conditional_reach_weight)
+            .sum::<f64>();
+        assert!((reach_sum - 1.0).abs() < 1e-6);
     }
 
     #[test]

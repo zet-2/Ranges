@@ -131,6 +131,74 @@ class CaseAndPromptTests(unittest.TestCase):
             [case.spec.cache_key for case in loaded],
         )
 
+    def test_representative_suite_is_stratified_and_round_trips(self):
+        cases = bench.representative_validation_cases()
+        self.assertEqual(22, len(cases))
+        self.assertEqual(len(cases), len({case.case_id for case in cases}))
+        self.assertEqual(
+            len(cases),
+            len({case.spec.cache_key for case in cases}),
+        )
+        self.assertEqual(
+            {"FLOP", "TURN", "RIVER"},
+            {case.spec.street.value for case in cases},
+        )
+        self.assertEqual(
+            {0, 1, 2},
+            {len(case.spec.tree.action_history) for case in cases},
+        )
+        self.assertTrue(
+            {200, 400, 800}.issubset(
+                {case.spec.tree.effective_stack for case in cases}
+            )
+        )
+        self.assertTrue(any(case.spec.tree.rake_rate_pct > 0 for case in cases))
+        self.assertEqual(
+            {
+                bench.AllocationMode.UNCOMPRESSED_F32,
+                bench.AllocationMode.COMPRESSED_I16,
+            },
+            {case.spec.parameters.allocation_mode for case in cases},
+        )
+        self.assertTrue(
+            any(
+                case.spec.parameters.bet_sizes.turn_donk_sizes is None
+                and case.spec.parameters.bet_sizes.river_donk_sizes == ""
+                for case in cases
+            )
+        )
+        self.assertTrue(
+            any(
+                case.spec.parameters.bet_sizes.river_donk_sizes == "25%"
+                for case in cases
+            )
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "representative.json"
+            bench.write_case_file(path, cases)
+            loaded = bench.load_case_file(path)
+        self.assertEqual(
+            [case.spec.cache_key for case in cases],
+            [case.spec.cache_key for case in loaded],
+        )
+
+    def test_stress_suite_adds_tight_and_two_size_flops(self):
+        representative = bench.representative_validation_cases()
+        stress = bench.stress_validation_cases()
+        self.assertEqual(len(representative) + 2, len(stress))
+        self.assertEqual(
+            "0.1",
+            str(stress[-2].spec.parameters.target_exploitability_pct),
+        )
+        self.assertEqual(
+            {
+                Action(ActionKind.CHECK),
+                Action(ActionKind.BET, 33),
+                Action(ActionKind.BET, 75),
+            },
+            set(stress[-1].spec.tree.modeled_actions),
+        )
+
     def test_case_file_rejects_live_usage_and_unknown_fields(self):
         payload = bench.case_file_data([bench.demo_case()])
         payload["usage"] = "live"
@@ -544,6 +612,48 @@ class ResponseAndScoringTests(unittest.TestCase):
 
 
 class RunnerAndReportTests(unittest.TestCase):
+    def test_solve_only_report_never_requires_model_completions(self):
+        cases = bench.demo_cases()
+        results = {
+            case.spec.cache_key: fake_result(case.spec)
+            for case in cases
+        }
+        cache_hits = {
+            case.spec.cache_key: index % 2 == 0
+            for index, case in enumerate(cases)
+        }
+
+        report = bench.build_oracle_validation_report(
+            cases,
+            results,
+            cache_hits,
+            engine_binary="/opt/gto-oracle-engine",
+            engine_timeout_seconds=600.0,
+            suite_name="demo",
+        )
+
+        self.assertTrue(report["run_complete"])
+        self.assertEqual(len(cases), report["case_count"])
+        self.assertEqual(sum(cache_hits.values()), report["cache_hits"])
+        self.assertEqual("demo", report["suite"])
+        self.assertEqual(
+            {"RIVER": 2, "TURN": 1},
+            report["coverage"]["streets"],
+        )
+        self.assertEqual("0.03", report["solver_elapsed_seconds_total"])
+        self.assertEqual(
+            {
+                "estimated_uncompressed_bytes": None,
+                "estimated_compressed_bytes": None,
+                "hard_limit_bytes": None,
+                "allocation_mode": None,
+            },
+            report["cases"][0]["memory"],
+        )
+        self.assertNotIn("models", report)
+        self.assertNotIn("provider_calls_enabled", report)
+        self.assertTrue(all(case["converged"] for case in report["cases"]))
+
     def test_changed_engine_binary_invalidates_oracle_cache(self):
         case = bench.demo_case()
         current = fake_result(case.spec)

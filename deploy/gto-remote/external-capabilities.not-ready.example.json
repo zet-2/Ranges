@@ -1,0 +1,24 @@
+{
+  "backend_id": "replace-me",
+  "backend_version": "0",
+  "preflop_mode": "NONE",
+  "postflop_mode": "NONE",
+  "max_postflop_players": 0,
+  "stateful_through_river": false,
+  "range_conditioning": "NONE",
+  "folded_card_bunching": false,
+  "card_model": "ABSTRACT_BUCKETS",
+  "action_model": "FIXED_DISCRETE_TREE",
+  "convergence_metric": "not configured",
+  "source_license": "replace with the actual license",
+  "full_six_max_ready": false,
+  "full_six_max_gaps": [
+    "preflop is not a compatible solved full-game tree",
+    "postflop backend is not a multiway game tree",
+    "postflop backend supports fewer than six players",
+    "one action-conditioned tree is not retained through river",
+    "ranges are not conditioned on every public action",
+    "folded-card bunching is not modeled",
+    "private-card model is bucketed"
+  ]
+}
