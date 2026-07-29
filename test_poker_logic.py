@@ -377,6 +377,32 @@ class VisionWireFormatTests(unittest.TestCase):
         self.assertEqual(["Fold", "Call", "Raise"], state.last_action_context.hero_action_options)
         self.assertEqual(11, state.last_action_context.amount_to_call)
 
+    def test_all_in_chip_bubble_cannot_become_a_remaining_stack(self):
+        payload = {
+            "n": ["Andy", "mikeCase860", "Villain", "", "Hero", "Dealer"],
+            # Gemini copied the external 21.6 BB bubble into the stack array.
+            "s": [76, 21.6, 150.5, 0, 78.8, 111.3],
+            "w": [1, 0, 1, 0, 1, 1],
+            "x": ["A", "I", "A", "F", "A", "A"],
+            "d": 5,
+            "v": ["", "", "", "FOLD", "", ""],
+            "h": ["Ac", "9c"],
+            "b": [],
+            "p": 27.1,
+            "o": ["FOLD", "CALL", "RAISE"],
+            "c": 20.6,
+        }
+
+        state = app.parse_response(
+            json.dumps(payload),
+            hero_turn_confirmed=True,
+        )
+        all_in = next(player for player in state.players if player.seat_index == 1)
+
+        self.assertEqual("ALL_IN", all_in.status)
+        self.assertEqual(0.0, all_in.stack_size)
+        self.assertEqual(21.6, all_in.current_bet)
+
     def test_mosaic_request_adds_lossless_card_detail_and_structured_json(self):
         captures = self.captures()
         mosaic = app.build_vision_mosaic(captures)
@@ -392,6 +418,87 @@ class VisionWireFormatTests(unittest.TestCase):
         self.assertEqual(400, config.max_output_tokens)
         self.assertIsNotNone(config.response_json_schema)
         self.assertNotIn("pattern", config.response_json_schema["properties"]["h"]["items"])
+        self.assertIn("Contributed:", contents[0])
+        self.assertIn(
+            "literal Pot:",
+            config.response_json_schema["properties"]["p"]["description"],
+        )
+
+        pot_contents, pot_config = app.build_total_pot_reread_request(captures)
+        self.assertEqual(2, len(pot_contents))
+        self.assertEqual("image/png", pot_contents[1].inline_data.mime_type)
+        self.assertEqual(40, pot_config.max_output_tokens)
+        self.assertEqual(
+            ["p"],
+            pot_config.response_json_schema["required"],
+        )
+        self.assertEqual(219, app.SEAT_ZONES["board"]["top"])
+
+    def test_wager_always_gets_a_board_only_ai_pot_reread(self):
+        cases = [
+            # Gemini copied `Contributed: 2 BB`; parsing raised it to the bet.
+            ("contributed", 2, 5.67, 11.3, ["Jc", "5d", "4c"]),
+            # Gemini copied the plausible previous-pot chip pile.
+            ("previous pot", 3.78, 2, 5.78, ["Jh", "6s", "9h", "Ks", "3h"]),
+            # The same confusion also occurs before community cards are dealt.
+            ("preflop contributed", 1.5, 20.6, 27.1, []),
+        ]
+        for label, initial_pot, call_amount, expected_pot, board in cases:
+            with self.subTest(label=label):
+                payload = {
+                    "n": [
+                        "",
+                        "mdk54",
+                        "jimmyd123128",
+                        "Sir-bubba-20",
+                        "biba287",
+                        "",
+                    ],
+                    "s": [0, 51, 114.8, 68, 97, 0],
+                    "w": [0, 0, 0, call_amount, 0, 0],
+                    "x": ["E", "F", "A", "A", "A", "E"],
+                    "d": 2,
+                    "v": ["", "", "", "", "", ""],
+                    "h": ["4s", "3s"],
+                    "b": board,
+                    "p": initial_pot,
+                    "o": ["FOLD", "CALL", "RAISE"],
+                    "c": call_amount,
+                }
+                client = mock.Mock()
+                client.models.generate_content.side_effect = [
+                    SimpleNamespace(text=json.dumps(payload), usage_metadata=None),
+                    SimpleNamespace(
+                        text=json.dumps({"p": expected_pot}),
+                        usage_metadata=None,
+                    ),
+                ]
+
+                with mock.patch.object(app, "gemini_client", client):
+                    state, _ = app.analyze_captures(
+                        self.captures(),
+                        hero_turn_confirmed=True,
+                    )
+
+                self.assertEqual(expected_pot, state.board_state.total_pot)
+                self.assertEqual(2, client.models.generate_content.call_count)
+                focused_call = (
+                    client.models.generate_content.call_args_list[1].kwargs
+                )
+                self.assertEqual(2, len(focused_call["contents"]))
+                self.assertIn("Contributed:", focused_call["contents"][0])
+                self.assertFalse(
+                    app.displayed_pot_conflicts_with_call(state)
+                )
+                self.assertFalse(
+                    any(
+                        "pot must exceed the call amount" in error
+                        for error in app.validate_snapshot_candidate(
+                            state,
+                            require_hero_hand=True,
+                        )
+                    )
+                )
 
     def test_gemini_request_error_is_preserved_for_the_retry_panel(self):
         captures = self.captures()
@@ -630,7 +737,7 @@ class FastValidationTests(unittest.TestCase):
         self.assertTrue(any("same card" in error for error in errors))
         self.assertTrue(any("non-negative" in error for error in errors))
 
-    def test_postflop_inclusive_pot_must_exceed_call_amount(self):
+    def test_displayed_pot_must_exceed_call_amount_on_every_street(self):
         state = self.valid_state(pot=4.0)
         state.last_action_context = app.LastActionContext(
             amount_to_call=4.0,
@@ -644,6 +751,18 @@ class FastValidationTests(unittest.TestCase):
 
         state.board_state.total_pot = 5.0
         self.assertFalse(
+            any(
+                "pot must exceed the call amount" in error
+                for error in app.validate_snapshot_candidate(
+                    state,
+                    require_hero_hand=True,
+                )
+            )
+        )
+
+        state.board_state.community_cards = []
+        state.board_state.total_pot = 4.0
+        self.assertTrue(
             any(
                 "pot must exceed the call amount" in error
                 for error in app.validate_snapshot_candidate(

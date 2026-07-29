@@ -489,9 +489,15 @@ VISUAL ANALYSIS INSTRUCTIONS (STRICT HIERARCHY):
    - **CURRENT BET (CONVERT TO BB):** 
      - **LOCATION:** Look for a SEPARATE "Pill" or Bubble located OUTSIDE the player pod, usually near the cards or center.
      - **WARNING:** Do NOT confuse the Stack Size (inside pod) with the Current Bet.
-     - If the player is All-In, the Stack Size might be 0.0, and the chips are in the Bet Bubble.
+     - If the player pod says `All In`, Stack Size MUST be 0.0 and the separate
+       chip amount belongs to Current Bet.
      - Apply same conversion rules (Currency -> BB).
-   - **TOTAL POT:** Read the central `Pot:` label exactly. Do not calculate it and do not add current bets to it. Example: `Pot: 3.5 BB` means total_pot_bb=3.5.
+   - **TOTAL POT:** Read ONLY the number immediately after the literal central
+     `Pot:` label in the Board image. Do not use the separate `Contributed:`
+     value, a player's bet bubble, or the `Call`/`Raise To` button amounts. Do
+     not calculate it and do not add current bets to it. Example: if the board
+     says `Pot: 11.3 BB`, the line below says `Contributed: 2 BB`, and the
+     action button says `Call 5.67 BB`, then total_pot_bb=11.3.
    - **DEALER BUTTON:** Look for a small white circular disk with a black "D". It can be next to any player type.
    - **VISIBLE ACTION:** Text such as Check, Fold, Call, Bet, or Raise may temporarily replace a username. Put it in visible_action; do not use it as the username.
 
@@ -537,11 +543,11 @@ IMPORTANT BUTTON RULE:
 # available sooner, while parse_response() still materializes the same domain
 # objects used by the rest of the application.
 FAST_ANALYZE_PROMPT = """Analyze the three labelled PokerStars Carbon images.
-Image 1 is the table mosaic. Image 2 repeats HERO, BOARD, and ACTIONS. Image 3 is a lossless enlarged HERO+BOARD card crop and is authoritative for ranks and suit glyphs. Labels map to seats S0-S5; HERO is S4.
+Image 1 is the table mosaic. Image 2 repeats HERO, BOARD, and ACTIONS. Image 3 is a lossless enlarged HERO+BOARD crop and is authoritative for ranks, suit glyphs, and the literal Pot label. Labels map to seats S0-S5; HERO is S4.
 Read each actual suit glyph shape; red may be hearts or diamonds and black may be spades or clubs. Emit cards as rank+suit.
-All six-seat arrays are ordered S0,S1,S2,S3,S4,S5. n=usernames, s=stacks inside pods, w=separate current bets, x=status codes, v=visible action overlays. d is the dealer seat index or -1.
+All six-seat arrays are ordered S0,S1,S2,S3,S4,S5. n=usernames, s=stacks inside pods, w=separate current bets, x=status codes, v=visible action overlays. d is the dealer seat index or -1. If a pod says `All In` instead of showing a numeric stack, use s=0 and put the separate all-in chip amount in w.
 x codes: A=cards visible/active, F=name+stack but no cards/folded, I=all-in, S=sitting out, E=empty.
-p is the displayed total Pot value exactly; never calculate it or add bets.
+p is ONLY the number immediately after the literal `Pot:` label in BOARD. Never use the `Contributed:` number, an isolated bet pill, or a Call/Raise button amount. Example: `Pot: 11.3 BB`, `Contributed: 2 BB`, and `Call 5.67 BB` means p=11.3 and c=5.67. Never calculate p or add bets. Whenever c>0, re-read the Pot label if p is not greater than c.
 h contains only Hero's two cards. o contains only the large current action buttons; ignore small Check/Check-Fold/Call-Any checkboxes. c is the incremental amount Hero must call, or 0 when Check is available.
 Use empty strings for an absent username/action and return only the requested structured data."""
 
@@ -558,12 +564,18 @@ FAST_VISION_SCHEMA = {
             "type": "array",
             "minItems": 6,
             "maxItems": 6,
+            "description": (
+                "Numeric stacks inside player pods; use 0 when a pod says All In"
+            ),
             "items": {"type": "number", "minimum": 0},
         },
         "w": {
             "type": "array",
             "minItems": 6,
             "maxItems": 6,
+            "description": (
+                "Separate chip amounts outside pods, including every all-in amount"
+            ),
             "items": {"type": "number", "minimum": 0},
         },
         "x": {
@@ -598,7 +610,14 @@ FAST_VISION_SCHEMA = {
             },
             "maxItems": 5,
         },
-        "p": {"type": "number", "minimum": 0},
+        "p": {
+            "type": "number",
+            "minimum": 0,
+            "description": (
+                "Exact number after the literal Pot: label in BOARD; never the "
+                "Contributed: value, a bet pill, or a button amount"
+            ),
+        },
         "o": {
             "type": "array",
             "items": {
@@ -607,9 +626,36 @@ FAST_VISION_SCHEMA = {
             },
             "maxItems": 3,
         },
-        "c": {"type": "number", "minimum": 0},
+        "c": {
+            "type": "number",
+            "minimum": 0,
+            "description": (
+                "Incremental amount on the large Call button, or 0 when Check "
+                "is available; never the Pot: value"
+            ),
+        },
     },
     "required": ["n", "s", "w", "x", "d", "v", "h", "b", "p", "o", "c"],
+    "additionalProperties": False,
+}
+
+POT_REREAD_PROMPT = """Read exactly one value from this PokerStars BOARD crop.
+Locate the line whose literal text begins `Pot:` and return only the number
+immediately after `Pot:` as p. Ignore every `Contributed:` value, card rank,
+player bet amount, and action-button amount. Do not calculate or infer the pot.
+Example: `Pot: 11.3 BB` above `Contributed: 2 BB` means {"p":11.3}, never 2.
+Return only the requested structured data."""
+
+POT_REREAD_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "p": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Exact number immediately following the literal Pot: label",
+        },
+    },
+    "required": ["p"],
     "additionalProperties": False,
 }
 
@@ -700,7 +746,10 @@ SEAT_ZONES = {
     "seat4": {"left": 626.46484375, "top": 355.68359375, "width": 314.81640625, "height": 119.01171875},
     "hero":  {"left": 335.921875, "top": 413.3359375, "width": 263.04296875, "height": 167.8828125}, # Seat 5
     "seat6": {"left": 15.7578125, "top": 346.51953125, "width": 340.4765625, "height": 125.2890625},
-    "board": {"top": 249, "left": 308, "width": 346, "height": 155} 
+    # Start above both central labels. The old top=249 clipped out `Pot:` and
+    # left `Contributed:` plus the previous-pot chip pile as the only numbers
+    # Gemini could see in the dedicated BOARD crop.
+    "board": {"top": 219, "left": 308, "width": 346, "height": 155}
 }
 BUTTONS_REGION = {"left": 472, "top": 579, "width": 483, "height": 141} # User provided
 
@@ -824,7 +873,7 @@ def build_vision_core_detail(captures: dict) -> Image.Image:
 
 
 def build_vision_card_detail(captures: dict) -> Image.Image:
-    """Losslessly enlarge only Hero and board cards for suit classification."""
+    """Losslessly enlarge Hero plus authoritative board cards and Pot label."""
     canvas = Image.new("RGB", (1000, 600), (18, 20, 23))
     draw = ImageDraw.Draw(canvas)
     try:
@@ -845,7 +894,11 @@ def build_vision_card_detail(captures: dict) -> Image.Image:
 
     cells = [
         ("HERO CARDS — GLYPH SHAPE IS AUTHORITATIVE", hero, (8, 8, 992, 292)),
-        ("BOARD CARDS — MATCH SUIT GLYPH SHAPES", board, (8, 300, 992, 592)),
+        (
+            "BOARD CARDS + LITERAL POT LABEL — AUTHORITATIVE",
+            board,
+            (8, 300, 992, 592),
+        ),
     ]
     for label, image, (left, top, right, bottom) in cells:
         draw.rectangle((left, top, right, bottom), outline=(82, 91, 101), width=2)
@@ -1374,6 +1427,13 @@ def parse_response(
             player.stack_size = float(stack_val)
             
             player.current_bet = float(p_data.get("current_bet_bb") or p_data.get("bet") or 0)
+            if p_data.get("is_all_in", False):
+                # Gemini sometimes copies the external all-in chip bubble into
+                # `stack` because the pod itself contains only the words
+                # "All In". Normalize that unambiguous visual state here.
+                if player.current_bet <= 0 and player.stack_size > 0:
+                    player.current_bet = player.stack_size
+                player.stack_size = 0.0
             player.is_hero = (idx == 4) # Assuming Seat 5 (Index 4) is Hero
             if player.is_hero:
                 player.username = HERO_USERNAME
@@ -1733,6 +1793,89 @@ def build_vision_request(captures: dict) -> tuple[list, types.GenerateContentCon
     )
 
 
+def build_total_pot_reread_request(
+    captures: dict,
+) -> tuple[list, types.GenerateContentConfig]:
+    """Build a lossless, board-only request for an ambiguous Pot label."""
+    board = captures["board"].convert("RGB")
+    board_detail = board.resize(
+        (max(1, board.width * 3), max(1, board.height * 3)),
+        Image.Resampling.NEAREST,
+    )
+    return (
+        [
+            POT_REREAD_PROMPT,
+            image_to_gemini_png_part(board_detail),
+        ],
+        types.GenerateContentConfig(
+            max_output_tokens=40,
+            thinking_config=types.ThinkingConfig(
+                thinking_level=types.ThinkingLevel.MINIMAL
+            ),
+            media_resolution=gemini_media_resolution(),
+            response_mime_type="application/json",
+            response_json_schema=POT_REREAD_SCHEMA,
+        ),
+    )
+
+
+def parse_total_pot_reread(text: str) -> float:
+    """Parse one schema-constrained Pot reread without accepting coercions."""
+    data = json.loads(text.strip())
+    value = data.get("p") if isinstance(data, dict) else None
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0
+    ):
+        raise ValueError("Gemini Pot reread did not return a valid BB amount")
+    return float(value)
+
+
+def displayed_pot_conflicts_with_call(snapshot: GameSnapshot) -> bool:
+    """Return whether the displayed Pot was likely confused with another label."""
+    pot = snapshot.board_state.total_pot
+    call_amount = snapshot.last_action_context.amount_to_call
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        for value in (pot, call_amount)
+    ):
+        return False
+    return bool(
+        call_amount > 0
+        and pot <= call_amount + 0.15
+    )
+
+
+def should_reread_total_pot(snapshot: GameSnapshot) -> bool:
+    """Verify the literal Pot label whenever Hero faces a wager."""
+    call_amount = snapshot.last_action_context.amount_to_call
+    return bool(
+        not isinstance(call_amount, bool)
+        and isinstance(call_amount, (int, float))
+        and math.isfinite(call_amount)
+        and call_amount > 0
+    )
+
+
+def reread_total_pot(captures: dict) -> float:
+    """Ask Gemini to inspect only the literal Pot label in the saved frame."""
+    contents, config = build_total_pot_reread_request(captures)
+    response = gemini_client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=contents,
+        config=config,
+    )
+    if not response.text:
+        raise ValueError("Gemini returned no text for the Pot reread")
+    with open("debug_vision_pot_response.txt", "w") as file:
+        file.write(response.text)
+    return parse_total_pot_reread(response.text)
+
+
 def analyze_captures(
     comps: dict,
     *,
@@ -1770,6 +1913,37 @@ def analyze_captures(
             locally_dealt_seats,
             hero_turn_confirmed=hero_turn_confirmed,
         )
+        if should_reread_total_pot(snapshot):
+            original_pot = snapshot.board_state.total_pot
+            console.print(
+                "[dim]Hero faces a wager; verifying the literal Pot label "
+                "from BOARD only.[/dim]"
+            )
+            try:
+                corrected_pot = reread_total_pot(comps)
+                if corrected_pot > (
+                    snapshot.last_action_context.amount_to_call + 0.15
+                ):
+                    snapshot.board_state.total_pot = corrected_pot
+                    if abs(corrected_pot - original_pot) > 0.01:
+                        console.print(
+                            "[dim]Vision Pot corrected: "
+                            f"{original_pot:g} -> {corrected_pot:g} BB[/dim]"
+                        )
+                    else:
+                        console.print(
+                            f"[dim]Vision Pot verified: {corrected_pot:g} BB[/dim]"
+                        )
+                else:
+                    snapshot.vision_error = (
+                        "Focused Pot reread remained inconsistent with the "
+                        "amount to call"
+                    )
+            except Exception as pot_error:
+                snapshot.vision_error = (
+                    "Focused Pot reread failed "
+                    f"({type(pot_error).__name__}): {pot_error}"
+                )
         console.print(f"[dim]Parsed {len(snapshot.players)} players[/dim]")
     except Exception as e:
         console.print(f"[red]Vision Error: {e}[/red]")
@@ -3539,16 +3713,12 @@ def validate_snapshot_candidate(
     call_amount = snapshot.last_action_context.amount_to_call
     if call_amount > 0 and "CHECK" in options:
         errors.append("Check cannot be legal while facing a positive call amount")
-    if (
-        board
-        and call_amount > 0
-        and snapshot.board_state.total_pot <= call_amount + 0.15
-    ):
+    if displayed_pot_conflicts_with_call(snapshot):
         # PokerStars' displayed pot already includes the outstanding wager.
         # If it is no larger than the amount Hero must call, Vision mixed two
         # different frames (or misread one of the values), so neither pot odds
         # nor a solver root can be trusted.
-        errors.append("postflop displayed total pot must exceed the call amount")
+        errors.append("displayed total pot must exceed the call amount")
     return errors
 
 
