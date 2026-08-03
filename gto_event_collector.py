@@ -11,7 +11,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
+from enum import Enum
 import os
+import threading
 from typing import Mapping
 
 from gto_hand_history import (
@@ -31,6 +33,16 @@ _STREET_INDEX = {"PREFLOP": 0, "FLOP": 1, "TURN": 2, "RIVER": 3}
 
 class PublicEventCollectionError(ValueError):
     """Observed frames cannot prove one contiguous public action path."""
+
+
+class PublicEventProbeStatus(str, Enum):
+    """Outcome of a non-mutating candidate observation."""
+
+    REJECTED = "rejected"
+    ANCHORED = "anchored"
+    DUPLICATE = "duplicate"
+    ADVANCED = "advanced"
+    NEW_HAND_ANCHORED = "new_hand_anchored"
 
 
 def _decimal(value: object, field: str) -> Decimal:
@@ -135,6 +147,36 @@ class _SnapshotObservation:
     @property
     def player_map(self) -> dict[int, _PlayerObservation]:
         return {player.seat: player for player in self.players}
+
+
+@dataclass(frozen=True, slots=True)
+class PublicEventProbe:
+    """A transactional recorder candidate produced without changing state.
+
+    Accepted probes are tied to ``base_version``.  They can be committed only
+    while the recorder remains at that exact version, which prevents a delayed
+    decoder result from overwriting a newer accepted observation.
+    """
+
+    status: PublicEventProbeStatus
+    base_version: int
+    candidate_hand_id: str
+    replaces_hand: bool
+    history: PublicHandHistory | None = None
+    error: str = ""
+    base_event_count: int = 0
+    _snapshot: _SnapshotObservation | None = None
+    _owner_token: object | None = None
+
+    @property
+    def accepted(self) -> bool:
+        return self.status is not PublicEventProbeStatus.REJECTED
+
+    @property
+    def events_added(self) -> int:
+        if not self.accepted or self.history is None:
+            return 0
+        return max(0, len(self.history.events) - self.base_event_count)
 
 
 def _attribute(value: object, name: str, context: str) -> object:
@@ -288,15 +330,38 @@ class PublicHandEventRecorder:
         self.history: PublicHandHistory | None = None
         self.last_snapshot: _SnapshotObservation | None = None
         self.error: str = ""
+        self._version = 0
+        self._probe_owner = object()
+        self._lock = threading.RLock()
 
     @property
     def complete(self) -> bool:
-        return self.history is not None and not self.error
+        with self._lock:
+            return self.history is not None and not self.error
+
+    @property
+    def version(self) -> int:
+        """Return the monotonic state version used by transactional probes."""
+
+        with self._lock:
+            return self._version
 
     def reset(self) -> None:
-        self.history = None
-        self.last_snapshot = None
-        self.error = ""
+        with self._lock:
+            self.history = None
+            self.last_snapshot = None
+            self.error = ""
+            self._version += 1
+
+    def invalidate_gap(self, reason: str) -> None:
+        """Make the current transcript unavailable after an explicit input gap."""
+
+        detail = str(reason or "").strip()
+        if not detail:
+            raise PublicEventCollectionError("capture gap reason cannot be empty")
+        with self._lock:
+            self.error = f"capture gap: {detail}"
+            self._version += 1
 
     def _initial_history(
         self,
@@ -305,6 +370,11 @@ class PublicHandEventRecorder:
         if snapshot.street != "PREFLOP" or snapshot.board:
             raise PublicEventCollectionError(
                 "recording must start on a preflop frame before any voluntary action"
+            )
+        if any(player.visible_action for player in snapshot.players):
+            raise PublicEventCollectionError(
+                "first frame has a visible voluntary-action overlay and "
+                "cannot prove an untouched forced-bet state"
             )
         seats = tuple(
             HandSeat(
@@ -576,38 +646,141 @@ class PublicHandEventRecorder:
             )
         return history
 
-    def observe(self, raw_snapshot: object) -> PublicHandHistory | None:
-        """Consume one frame and return a complete transcript when available."""
+    def probe(self, raw_snapshot: object) -> PublicEventProbe:
+        """Evaluate one candidate without mutating or poisoning recorder state."""
 
-        try:
-            snapshot = _snapshot(raw_snapshot)
-            if self.history is not None and snapshot.hand_id != self.history.hand_id:
-                self.reset()
-            if self.error:
-                return None
-            if self.history is None:
-                self.history = self._initial_history(snapshot)
-                self.last_snapshot = snapshot
-                return self.history
+        with self._lock:
+            base_version = self._version
+            base_event_count = (
+                len(self.history.events) if self.history is not None else 0
+            )
+            snapshot: _SnapshotObservation | None = None
+            candidate_hand_id = ""
+            replaces_hand = False
+            try:
+                snapshot = _snapshot(raw_snapshot)
+                candidate_hand_id = snapshot.hand_id
+                replaces_hand = bool(
+                    self.history is not None
+                    and snapshot.hand_id != self.history.hand_id
+                )
+                if self.error and not replaces_hand:
+                    raise PublicEventCollectionError(self.error)
 
-            replayed = replay_public_hand(self.history)
-            if self._matches(replayed, snapshot) and not self._new_explicit_action(
-                replayed,
-                snapshot,
+                if self.history is None or replaces_hand:
+                    history = self._initial_history(snapshot)
+                    return PublicEventProbe(
+                        status=(
+                            PublicEventProbeStatus.NEW_HAND_ANCHORED
+                            if replaces_hand
+                            else PublicEventProbeStatus.ANCHORED
+                        ),
+                        base_version=base_version,
+                        candidate_hand_id=candidate_hand_id,
+                        replaces_hand=replaces_hand,
+                        history=history,
+                        base_event_count=(
+                            0 if replaces_hand else base_event_count
+                        ),
+                        _snapshot=snapshot,
+                        _owner_token=self._probe_owner,
+                    )
+
+                replayed = replay_public_hand(self.history)
+                if self._matches(
+                    replayed,
+                    snapshot,
+                ) and not self._new_explicit_action(
+                    replayed,
+                    snapshot,
+                ):
+                    return PublicEventProbe(
+                        status=PublicEventProbeStatus.DUPLICATE,
+                        base_version=base_version,
+                        candidate_hand_id=candidate_hand_id,
+                        replaces_hand=False,
+                        history=self.history,
+                        base_event_count=base_event_count,
+                        _snapshot=snapshot,
+                        _owner_token=self._probe_owner,
+                    )
+
+                history = self._advance(self.history, snapshot)
+                return PublicEventProbe(
+                    status=PublicEventProbeStatus.ADVANCED,
+                    base_version=base_version,
+                    candidate_hand_id=candidate_hand_id,
+                    replaces_hand=False,
+                    history=history,
+                    base_event_count=base_event_count,
+                    _snapshot=snapshot,
+                    _owner_token=self._probe_owner,
+                )
+            except (PublicEventCollectionError, PublicHandHistoryError) as error:
+                return PublicEventProbe(
+                    status=PublicEventProbeStatus.REJECTED,
+                    base_version=base_version,
+                    candidate_hand_id=candidate_hand_id,
+                    replaces_hand=replaces_hand,
+                    error=str(error),
+                    base_event_count=base_event_count,
+                    _snapshot=snapshot,
+                    _owner_token=self._probe_owner,
+                )
+
+    def commit(self, probe: PublicEventProbe) -> PublicHandHistory:
+        """Atomically accept a successful probe if its base state is current."""
+
+        with self._lock:
+            if not isinstance(probe, PublicEventProbe):
+                raise PublicEventCollectionError(
+                    "probe must be a PublicEventProbe"
+                )
+            if probe._owner_token is not self._probe_owner:
+                raise PublicEventCollectionError(
+                    "cannot commit observation probe from another recorder"
+                )
+            if (
+                not probe.accepted
+                or probe.history is None
+                or probe._snapshot is None
             ):
-                self.last_snapshot = snapshot
-                return self.history
+                raise PublicEventCollectionError(
+                    "cannot commit rejected observation: "
+                    f"{probe.error or 'unknown error'}"
+                )
+            if probe.base_version != self._version:
+                raise PublicEventCollectionError(
+                    "cannot commit stale observation probe"
+                )
 
-            self.history = self._advance(self.history, snapshot)
-            self.last_snapshot = snapshot
+            self.history = probe.history
+            self.last_snapshot = probe._snapshot
+            self.error = ""
+            self._version += 1
             return self.history
-        except (PublicEventCollectionError, PublicHandHistoryError) as error:
-            self.error = str(error)
-            return None
+
+    def observe(self, raw_snapshot: object) -> PublicHandHistory | None:
+        """Consume one frame with the legacy fail-closed mutation semantics."""
+
+        with self._lock:
+            probe = self.probe(raw_snapshot)
+            if not probe.accepted:
+                # Preserve the original behavior: seeing a different hand
+                # resets the old transcript before a malformed/late new anchor
+                # fails.
+                if probe.replaces_hand:
+                    self.reset()
+                self.error = probe.error
+                self._version += 1
+                return None
+            return self.commit(probe)
 
 
 __all__ = [
     "PublicEventCollectionError",
     "PublicEventCollectorConfig",
+    "PublicEventProbe",
+    "PublicEventProbeStatus",
     "PublicHandEventRecorder",
 ]

@@ -31,7 +31,9 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 TasksMax=512
 LimitNOFILE=4096
 
-# Set this above GTO_ENGINE_MAX_MEMORY_GIB but below physical RAM.
+# Set this above GTO_ENGINE_MAX_MEMORY_GIB but below physical RAM. For an
+# external adapter this host-level cgroup ceiling is mandatory defense in
+# depth even though the server subreaper terminates the per-request descendants.
 # Examples: MemoryMax=112G with a 96-GiB engine guard, or MemoryMax=224G
 # with a 192-GiB guard on a 256-GiB host.
 # MemoryMax=112G

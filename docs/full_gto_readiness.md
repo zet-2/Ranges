@@ -18,8 +18,9 @@ backend without moving table capture off the Mac:
   cannot silently relabel the bundled HU backend as full six-max.
 
 What remains missing is the actual licensed or newly developed multiway solver
-behind that adapter, plus a continuous event source that observes every public
-transition.
+behind that adapter, plus production evidence that the experimental default-off
+continuous decoder observes every public transition in the supported table
+environment. Unproved transitions intentionally invalidate its transcript.
 
 ## Existing-backend audit
 
@@ -119,15 +120,15 @@ existing final freshness recapture. Deployment details are in
 The native HU path now losslessly reconstructs a solved flop game, adds exact
 observed aggressive sizes, traverses every action/chance node, and exports both
 conditional ranges through river. Its SQLite cache is keyed by the complete
-path. The remaining work below is therefore continuous capture, performance
-reuse, bunching, abstraction breadth, and multiway coverage—not basic HU range
-continuity.
+path. The remaining work below is therefore production validation of
+continuous capture, performance reuse, bunching, abstraction breadth, and
+multiway coverage—not basic HU range continuity.
 
-1. Feed the implemented event recorder from a continuous owned-simulator source.
-   The current recorder already validates every public check, fold, call,
-   bet-to, raise-to, all-in, board card, stack, pot, blind, ante, and rake
-   profile with chip conservation, but manual Hero-decision captures can skip
-   opponent transitions and therefore make the transcript unavailable.
+1. Validate the wired experimental Gemini decoder on an owned-simulator corpus.
+   The recorder already validates every public check, fold, call, bet-to,
+   raise-to, all-in, board card, stack, pot, blind, ante, and rake profile with
+   chip conservation. Capture/decode/queue gaps and visually unproved opponent
+   checks must continue to make the transcript unavailable.
 2. Replace one-shot lossless reconstruction with an optional persistent
    per-hand solver daemon so later decisions can reuse the already solved flop
    game instead of solving the same root for each new path.

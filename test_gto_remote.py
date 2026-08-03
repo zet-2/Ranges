@@ -12,6 +12,16 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from gto_remote.client import RemoteGTOClient, RemoteGTOClientConfig
+from gto_remote.capabilities import SolverCapabilities
+from gto_remote.multiway_outcome import (
+    MultiwayPolicyAction,
+    MultiwaySolveOutcome,
+    MultiwaySolveProof,
+    outcome_from_wire as multiway_outcome_from_wire,
+)
+from gto_remote.multiway_protocol import (
+    decision_fingerprint as multiway_decision_fingerprint,
+)
 from gto_remote.protocol import (
     RemoteProtocolError,
     build_evaluate_request,
@@ -28,10 +38,12 @@ from gto_remote.server import (
     EvaluationService,
     IdempotencyConflictError,
     ServerConfig,
+    UnsupportedSchemaError,
     create_server,
 )
 from live_gto import LiveDecisionState, LiveGTOOutcome, LiveGTOStatus
 from preflop_observation import ObservationProvenance, ObservedPreflopState
+from test_gto_multiway_protocol import four_way_state
 
 
 POSITIONS = ("UTG", "HJ", "CO", "BTN", "SB", "BB")
@@ -207,6 +219,20 @@ class EvaluationServiceTests(unittest.TestCase):
                 sample_state(hand_id="different"),
             )
 
+    def test_default_native_router_does_not_advertise_or_dispatch_v3(self) -> None:
+        router = _Router()
+        service = EvaluationService(router)
+        state = four_way_state()
+
+        self.assertEqual((2,), service.supported_schema_versions)
+        with self.assertRaisesRegex(UnsupportedSchemaError, "schema 3"):
+            service.evaluate(
+                "request-v3",
+                multiway_decision_fingerprint(state),
+                state,
+            )
+        self.assertEqual(0, router.calls)
+
     def test_second_solve_fails_fast_while_slot_is_busy(self) -> None:
         router = _Router(block=True)
         service = EvaluationService(router)
@@ -235,6 +261,91 @@ class EvaluationServiceTests(unittest.TestCase):
         worker.join(timeout=2)
         self.assertFalse(worker.is_alive())
         self.assertEqual(len(result), 1)
+
+    def test_service_preserves_a_structured_four_way_v3_policy(self) -> None:
+        capabilities = SolverCapabilities(
+            backend_id="service-multiway",
+            backend_version="1",
+            preflop_mode="SOLVED_TREE",
+            postflop_mode="MULTIWAY_TREE",
+            max_postflop_players=6,
+            stateful_through_river=True,
+            range_conditioning="ACTION_CONDITIONED_ALL_STREETS",
+            folded_card_bunching=True,
+            card_model="CARD_EXACT",
+            action_model="DYNAMIC_DISCRETE_TREE",
+            game_profile_id="sixmax-test",
+            abstraction_id="card-exact",
+            solution_concept="multiplayer Nash approximation",
+            convergence_metric="NashConv BB",
+            convergence_target=Decimal("0.1"),
+            source_license="owned test",
+        )
+
+        class MultiwayRouter:
+            supported_schema_versions = (2, 3)
+
+            def __init__(self):
+                self.capabilities = capabilities
+                self.calls = 0
+
+            def evaluate(self, state):
+                self.calls += 1
+                return MultiwaySolveOutcome(
+                    status=LiveGTOStatus.SOLVED,
+                    reason="",
+                    latency_seconds=Decimal("0.1"),
+                    cache_hit=False,
+                    policy=(
+                        MultiwayPolicyAction(
+                            "CHECK",
+                            None,
+                            Decimal("1"),
+                        ),
+                    ),
+                    proof=MultiwaySolveProof(
+                        backend_id=capabilities.backend_id,
+                        backend_version=capabilities.backend_version,
+                        capability_fingerprint=(
+                            capabilities.manifest_fingerprint
+                        ),
+                        game_profile_id="sixmax-test",
+                        abstraction_id="card-exact",
+                        solution_concept="multiplayer Nash approximation",
+                        metric_name="NashConv BB",
+                        metric_value=Decimal("0.05"),
+                        target_value=Decimal("0.1"),
+                        iterations=100,
+                        converged=True,
+                        approximate=True,
+                    ),
+                )
+
+        router = MultiwayRouter()
+        service = EvaluationService(router)
+        state = four_way_state()
+        fingerprint = multiway_decision_fingerprint(state)
+
+        body, cached = service.evaluate("request-v3", fingerprint, state)
+        restored = multiway_outcome_from_wire(
+            body,
+            expected_request_id="request-v3",
+            expected_fingerprint=fingerprint,
+            expected_state=state,
+            expected_backend_id=capabilities.backend_id,
+            expected_backend_version=capabilities.backend_version,
+            expected_capability_fingerprint=capabilities.manifest_fingerprint,
+            expected_game_profile_id=capabilities.game_profile_id,
+            expected_abstraction_id=capabilities.abstraction_id,
+            expected_solution_concept=capabilities.solution_concept,
+            expected_metric_name=capabilities.convergence_metric,
+            expected_target_value=capabilities.convergence_target,
+        )
+
+        self.assertFalse(cached)
+        self.assertEqual(LiveGTOStatus.SOLVED, restored.status)
+        self.assertEqual("CHECK", restored.policy[0].kind)
+        self.assertEqual(1, router.calls)
 
 
 class HTTPServerTests(unittest.TestCase):

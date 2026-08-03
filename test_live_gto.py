@@ -324,6 +324,42 @@ class RangeExpansionTests(unittest.TestCase):
         ):
             provider.ranges_for(make_state(preflop_observation=None))
 
+    def test_position_charts_label_explicit_position_only_handoff(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ranges.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "ranges": {
+                            "6max": {
+                                "BB": {"defend_vs_open": "AA"},
+                                "BTN": {"open": "KK"},
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            observation = replace(
+                make_hu_handoff(),
+                terminal=False,
+                provenance=ObservationProvenance(
+                    source=live.POSITION_ONLY_HANDOFF_SOURCE,
+                    hand_id="owned-sim-hand-17",
+                ),
+            )
+            ranges = live.PositionChartRangeProvider(path).ranges_for(
+                make_state(preflop_observation=observation)
+            )
+
+        self.assertTrue(ranges.approximate)
+        self.assertTrue(
+            any(
+                "terminal preflop wager was unavailable" in note
+                for note in ranges.approximations
+            )
+        )
+
 
 class ConfigurationTests(unittest.TestCase):
     def test_live_use_requires_explicit_owned_simulator_opt_in(self):

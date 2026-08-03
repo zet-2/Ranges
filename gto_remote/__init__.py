@@ -45,6 +45,17 @@ from .external_backend import (
     ExternalBackendTimeoutError,
     ExternalSolverBackend,
 )
+from .multiway_client import RemoteMultiwayClient
+from .multiway_outcome import (
+    MultiwayOutcomeError,
+    MultiwayPolicyAction,
+    MultiwaySolveOutcome,
+    MultiwaySolveProof,
+)
+from .multiway_protocol import (
+    MultiwayDecisionState,
+    MultiwayProtocolError,
+)
 
 __all__ = [
     "PROTOCOL_SCHEMA_VERSION",
@@ -72,6 +83,13 @@ __all__ = [
     "ExternalBackendProtocolError",
     "ExternalBackendTimeoutError",
     "ExternalSolverBackend",
+    "RemoteMultiwayClient",
+    "MultiwayDecisionState",
+    "MultiwayProtocolError",
+    "MultiwayOutcomeError",
+    "MultiwayPolicyAction",
+    "MultiwaySolveOutcome",
+    "MultiwaySolveProof",
     "build_evaluate_request",
     "decision_fingerprint",
     "decision_state_from_wire",

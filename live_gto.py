@@ -86,6 +86,7 @@ RANKS = "AKQJT98765432"
 SUITS = "cdhs"
 _CARD_RE = re.compile(r"^[2-9TJQKA][cdhs]$")
 _CLASS_RE = re.compile(r"^([2-9TJQKA])([2-9TJQKA])([so]?)$")
+POSITION_ONLY_HANDOFF_SOURCE = "gto_hu_position_continuity"
 
 
 class LiveGTOStatus(str, Enum):
@@ -413,7 +414,10 @@ def _verified_hu_handoff_reason(state: LiveDecisionState) -> str:
     observation = state.preflop_observation
     if not isinstance(observation, ObservedPreflopState):
         return "verified heads-up preflop handoff is missing"
-    if not observation.terminal:
+    position_only = (
+        observation.provenance.source == POSITION_ONLY_HANDOFF_SOURCE
+    )
+    if not observation.terminal and not position_only:
         return "verified preflop handoff is not terminal"
     if len(observation.live_positions) < 2:
         return (
@@ -587,7 +591,7 @@ class PositionChartRangeProvider:
         raise LiveGTORangeError(f"position {position} has no usable range")
 
     def ranges_for(self, state: LiveDecisionState) -> RangeBundle:
-        _require_verified_hu_handoff(state)
+        observation = _require_verified_hu_handoff(state)
         charts = self._charts()
         oop_position = state.hero_position if state.hero_is_oop else state.villain_position
         ip_position = state.villain_position if state.hero_is_oop else state.hero_position
@@ -607,6 +611,11 @@ class PositionChartRangeProvider:
         approximations = [
             "static position charts do not reconstruct the observed preflop action path"
         ]
+        if observation.provenance.source == POSITION_ONLY_HANDOFF_SOURCE:
+            approximations.append(
+                "the terminal preflop wager was unavailable; Hero and villain "
+                "positions are anchored to a same-hand preflop capture"
+            )
         if injected:
             approximations.append(
                 "Hero's observed combo was absent from the chart and was injected at full weight"

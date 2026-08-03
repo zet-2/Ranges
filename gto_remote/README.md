@@ -1,18 +1,21 @@
 # Remote live-GTO evaluator
 
-This package keeps OCR and table capture on the Mac while moving range
-reconstruction, cache access, and the CPU/RAM-heavy solve to a Linux machine.
-The Mac sends a strict `LiveDecisionState`; it never attempts to construct a
-remote `SolveSpec`.
+This package implements the contract path that keeps OCR and table capture on
+the Mac while moving range reconstruction, cache access, and the CPU/RAM-heavy
+solve to a server. HU protocol v2 sends a strict `LiveDecisionState`. Multiway
+protocol v3 instead sends a `MultiwayDecisionState` containing only the
+canonical public transcript, Hero seat/cards, and capture identity; every
+public fact is derived by replay. Neither path sends a remote `SolveSpec`. No
+licensed multiway solver adapter is installed by this repository.
 
 The live path is:
 
 ```text
 Mac capture/OCR
   -> local event recorder, legality, and freshness checks
-  -> authenticated LiveDecisionState + gap-free public-hand JSON
+  -> authenticated HU v2 state or transcript-first multiway v3 state
   -> remote native router or owned/licensed external solver adapter
-  -> minimal LiveGTOOutcome JSON
+  -> minimal HU outcome or structured multiway policy + convergence proof
   -> local legality check and final screen recapture
 ```
 
@@ -26,13 +29,23 @@ calls, bet-to/raise-to/all-in targets, and board deals. The server independently
 replays it with action-order, minimum-raise, stack, pot, board, and chip-
 conservation checks. A declared full six-max backend refuses a request without
 this transcript; sparse screenshots are never converted into invented actions.
-The native HU backend also consumes it whenever the hand was heads-up at the
-flop: it reconstructs the true flop tree, conditions both ranges on every
-recorded action/card through river, and caches the resulting exact path.
+The experimental, default-off continuous decoder now converts stable
+keyframes into this transcript and exposes it only as an atomic pair with the
+accepted snapshot. It invalidates the hand on capture/decode/queue gaps,
+ambiguous boundaries, or unproved transitions; pressing `j` only at Hero
+decisions still cannot guarantee full coverage, and an invisible opponent
+check is never invented. The native HU backend also consumes a transcript
+whenever the hand was heads-up at the flop: it reconstructs the true flop tree,
+conditions both ranges on every recorded action/card through river, and caches
+the resulting exact replayed action path.
 
 ## HTTP contract
 
-`POST /v1/evaluate` is synchronous and accepts:
+`POST /v1/evaluate` is synchronous. The configured router declares the schemas
+it can actually execute: the bundled native router accepts v2 only; the
+external adapter boundary accepts v2 and v3. A valid request for an
+unadvertised schema is rejected before router dispatch. The existing HU
+request is:
 
 ```json
 {
@@ -53,10 +66,21 @@ Idempotency-Key: <same value as request_id>
 X-Request-ID: <same value as request_id>
 ```
 
-The response contains only the decision fingerprint and the small
+For multiway, schema v3 contains exactly `capture_id`, `hero_seat`,
+`hero_combo`, and `public_hand`; it deliberately forbids duplicated board,
+pot, stack, street, legal-action, and singular-villain fields.
+
+The v2 response contains only the decision fingerprint and the small
 `LiveGTOOutcome` surface: status, reason, latency, analysis, source, model,
 cache hit, approximation flag, and solver spec key. Full ranges and result
 matrices remain on the server.
+
+The v3 response is structured rather than prose: a complete mixed policy with
+legal amount-to targets plus backend/version, manifest fingerprint, game and
+abstraction IDs, solution concept, iteration count, convergence metric/value/
+target, and an explicit approximation flag. The Mac checks policy frequencies,
+replayed action legality, all-in/minimum-raise targets, convergence, and pinned
+manifest identity before rendering human-readable advice.
 
 Only one evaluation can use the router at a time. A concurrent request gets
 HTTP `429` with `Retry-After: 1`; the client should not start an unbounded retry
@@ -87,10 +111,12 @@ Health endpoints:
 
 ## Mac client configuration
 
-After the solve server has a TLS URL, configure the Mac's private `.env`:
+After installing a real audited external solver adapter, configure the Mac's
+private `.env` for the finite-abstraction trial. The semantic capture decoder
+exists but remains experimental and default-off:
 
 ```dotenv
-STRATEGY_BACKEND=GTO
+STRATEGY_BACKEND=GTO_MULTIWAY
 GTO_LIVE_ENABLED=1
 GTO_OWNED_SIMULATOR_ACK=1
 GTO_EXECUTION_MODE=remote
@@ -98,15 +124,26 @@ GTO_EXECUTION_MODE=remote
 GTO_REMOTE_ENABLED=1
 GTO_REMOTE_ENDPOINT=https://solver.example.com/v1/evaluate
 GTO_REMOTE_AUTH_TOKEN=the-same-private-token-as-the-server
+GTO_REMOTE_PROTOCOL=multiway-v3
+GTO_REMOTE_CAPABILITIES_PATH=/absolute/path/to/audited-capabilities.json
 GTO_REMOTE_TIMEOUT_SECONDS=300
 GTO_REMOTE_ALLOW_INSECURE_HTTP=0
+
+PUBLIC_HISTORY_DECODER_ENABLED=1
+PUBLIC_HISTORY_DECODE_TIMEOUT_SECONDS=8
+LIVE_CAPTURE_FPS=8
+LIVE_CAPTURE_MAX_PENDING=128
+LIVE_CAPTURE_HEARTBEAT_SECONDS=5
 ```
 
 `GTO_ENGINE_PATH`, the solver cache, and the blueprint cache are server-owned
 in remote mode. A bad endpoint, timeout, authentication failure, oversized
 body, mismatched request ID, mismatched state fingerprint, or malformed
-response becomes a failed GTO outcome; strict `GTO` does not fall back to a
-language model.
+response becomes a failed solver outcome. `GTO_MULTIWAY` never falls back to a
+language model and accepts a policy only when the finite-game approximation is
+explicitly disclosed. Strict `GTO` also rejects that approximation.
+`multiway-v3` must target `GTO_SERVER_BACKEND=external`; the bundled `native`
+router must be paired with `hu-v2`.
 
 For initial testing without a domain, keep the server on loopback and open an
 SSH tunnel:
@@ -161,7 +198,7 @@ python3 -m gto_remote.server
 heads-up postflop subgame solver. Its manifest deliberately reports that it is
 not full six-max. Hardware cannot change those declared game-model limits.
 
-### External full-solver adapter
+### External solver adapter
 
 `GTO_SERVER_BACKEND=external` replaces the native router without changing the
 Mac protocol. It is a strict integration boundary for a solver executable that
@@ -176,15 +213,33 @@ GTO_EXTERNAL_ENV_JSON={"LICENSE_FILE":"/opt/full-gto/license.key"}
 GTO_EXTERNAL_TIMEOUT_SECONDS=300
 GTO_EXTERNAL_MAX_REQUEST_BYTES=4194304
 GTO_EXTERNAL_MAX_RESPONSE_BYTES=1048576
+GTO_EXTERNAL_ALLOW_BEST_EFFORT_PROCESS_CLEANUP=0
 ```
 
 The command is executed directly, never through a shell. It reads exactly one
-protocol-v2 evaluate request from stdin and writes exactly one protocol-v2
-response to stdout. Request ID and state fingerprint must match. Timeout,
+v2 or v3 request from stdin. For v3 it must return a structured v3 policy and
+proof bound to the declared capability-manifest fingerprint. Request ID and
+decision fingerprint must match. Timeout,
 nonzero exit, oversized output, malformed JSON, or an identity mismatch fails
 closed. The server bearer token and API-provider keys are not inherited by the
 adapter; only `PATH`, locale/timezone values, and the explicit
 `GTO_EXTERNAL_ENV_JSON` mapping are supplied.
+
+The supported external solve host is Linux. Before launching an adapter, the
+server enables child-subreaper semantics and serializes process supervision.
+When a request ends it kills the original process group, then kills and reaps
+every descendant adopted from that request, including children that
+double-fork or call `setsid()`. If `/proc` inspection or subreaper setup is
+unavailable, the request fails closed. Other operating systems are rejected by
+default because process groups alone cannot prove cleanup of daemonized
+children. `GTO_EXTERNAL_ALLOW_BEST_EFFORT_PROCESS_CLEANUP=1` is an unsafe,
+development-only acknowledgement; it must remain `0` on a deployed server.
+
+This process cleanup is not a substitute for an operating-system resource
+boundary. A hostile process can still attempt resource exhaustion before the
+server observes it. Run the dedicated service with `TasksMax`, a configured
+`MemoryMax`, restricted write paths, and `KillMode=control-group`; do not run
+unrelated child processes inside the same solve-server service.
 
 The manifest schema is demonstrated by
 [`external-capabilities.not-ready.example.json`](../deploy/gto-remote/external-capabilities.not-ready.example.json).
@@ -192,8 +247,11 @@ The example is intentionally not ready. Replace every declaration with audited
 facts from the integrated backend. A full-ready declaration requires a
 compatible solved preflop tree, multiway postflop support through six players,
 action-conditioned continuation through river, folded-card bunching, a
-card-exact private-card model, and a real convergence metric. The server derives
-the readiness flag and gaps again and rejects contradictory manifests.
+card-exact private-card model, `CONTINUOUS_NO_LIMIT` actions, an auditable
+multiplayer solution concept, and a real convergence metric. A fixed or dynamic
+discrete tree remains an approximation and every solved proof must disclose
+`approximate=true`. The server derives the readiness flag and gaps again and
+rejects contradictory manifests.
 
 The one-shot adapter may be a thin client to a persistent local solver daemon.
 It must not claim `stateful_through_river=true` unless it actually retains or

@@ -11,11 +11,13 @@ import json
 import time
 import io
 import base64
+import hashlib
 import itertools
 import math
 import re
 import threading
 import dataclasses
+from copy import deepcopy
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional
@@ -39,12 +41,42 @@ from live_gto import (
     LiveGTOConfigurationError,
     LiveGTOStatus,
     LiveGTORouter,
+    POSITION_ONLY_HANDOFF_SOURCE,
 )
-from gto_remote import RemoteGTOClient, RemoteGTOConfigurationError
+from gto_remote import (
+    MultiwayDecisionState,
+    MultiwayProtocolError,
+    RemoteGTOClient,
+    RemoteGTOConfigurationError,
+    RemoteMultiwayClient,
+)
 from gto_event_collector import PublicHandEventRecorder
-from gto_hand_history import PublicHandHistory, public_hand_to_wire
+from gto_hand_history import (
+    PublicHandHistory,
+    public_hand_to_wire,
+    replay_public_hand,
+)
+from live_capture import (
+    ContinuousCaptureService,
+    KeyframeDetector,
+    KeyframeRing,
+)
+from continuous_public_history_decoder import (
+    ContinuousPublicHistoryDecoder,
+    ContinuousPublicHistoryRuntime,
+)
+from pokerstars_live_capture import MSSRegionFrameSource
+from public_history_pipeline import (
+    AcceptedPublicHistoryFrame,
+    PublicHistoryCoordinator,
+)
+from public_history_worker import PublicHistoryWorker
 from preflop_observation import (
+    ObservedPreflopState,
+    ObservationProvenance,
+    PROVIDER_POSITIONS,
     PreflopObservationError,
+    canonical_position as canonical_preflop_position,
     current_decision as current_preflop_observation,
     terminal_from_history as terminal_preflop_observation,
 )
@@ -53,15 +85,18 @@ load_dotenv()
 console = Console()
 
 VALID_STRATEGY_BACKENDS = frozenset(
-    {"CLAUDE", "HYBRID", "GTO", "GTO_HU"}
+    {"CLAUDE", "HYBRID", "GTO", "GTO_HU", "GTO_MULTIWAY"}
 )
-SOLVER_STRATEGY_BACKENDS = frozenset({"HYBRID", "GTO", "GTO_HU"})
+SOLVER_STRATEGY_BACKENDS = frozenset(
+    {"HYBRID", "GTO", "GTO_HU", "GTO_MULTIWAY"}
+)
+CLAUDE_STRATEGY_BACKENDS = frozenset({"CLAUDE", "HYBRID"})
 DEFAULT_STRATEGY_BACKEND = "GTO"
 
-# Strict solver-only routing is the default. GTO_HU is the explicit
-# solver-only mode for the currently bounded six-max-to-HU continuation: it
-# may display an approximate HU subgame result but never relabels it full GTO
-# and never falls back to a language model.
+# Strict solver-only routing is the default. GTO_HU and GTO_MULTIWAY are
+# explicit solver-only modes for labelled finite-game approximations; neither
+# ever falls back to a language model or relabels a non-zero convergence gap
+# as an exact continuous-game solution.
 STRATEGY_BACKEND = os.getenv(
     "STRATEGY_BACKEND",
     DEFAULT_STRATEGY_BACKEND,
@@ -73,6 +108,11 @@ if STRATEGY_BACKEND not in VALID_STRATEGY_BACKENDS:
     )
     STRATEGY_BACKEND = DEFAULT_STRATEGY_BACKEND
 
+
+def claude_mode_available(backend: Optional[str] = None) -> bool:
+    """Return whether the selected runtime can ever route strategy to Claude."""
+    return (backend or STRATEGY_BACKEND).strip().upper() in CLAUDE_STRATEGY_BACKENDS
+
 # Configure Gemini (Vision)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
@@ -81,6 +121,34 @@ VISION_LAYOUT = os.getenv("VISION_LAYOUT", "mosaic").lower()
 SAVE_DEBUG_IMAGES = os.getenv("SAVE_DEBUG_IMAGES", "0").lower() in {
     "1", "true", "yes", "on"
 }
+LIVE_CAPTURE_ENABLED = os.getenv("LIVE_CAPTURE_ENABLED", "0").lower() in {
+    "1", "true", "yes", "on"
+}
+# Experimental semantic history is a separate opt-in.  LIVE_CAPTURE_ENABLED
+# remains a local-CV-only observer and never starts provider requests.
+PUBLIC_HISTORY_DECODER_ENABLED = os.getenv(
+    "PUBLIC_HISTORY_DECODER_ENABLED",
+    "0",
+).lower() in {"1", "true", "yes", "on"}
+LIVE_CAPTURE_FPS = max(
+    1.0,
+    min(20.0, float(os.getenv("LIVE_CAPTURE_FPS", "8"))),
+)
+LIVE_CAPTURE_MAX_PENDING = max(
+    8,
+    min(512, int(os.getenv("LIVE_CAPTURE_MAX_PENDING", "128"))),
+)
+LIVE_CAPTURE_HEARTBEAT_SECONDS = max(
+    0.5,
+    min(30.0, float(os.getenv("LIVE_CAPTURE_HEARTBEAT_SECONDS", "5"))),
+)
+PUBLIC_HISTORY_DECODE_TIMEOUT_SECONDS = max(
+    0.25,
+    min(
+        30.0,
+        float(os.getenv("PUBLIC_HISTORY_DECODE_TIMEOUT_SECONDS", "8")),
+    ),
+)
 OFFLINE_STRATEGY_ONLY = os.getenv("POKER_ASSISTANT_OFFLINE", "0").lower() in {
     "1", "true", "yes", "on"
 }
@@ -141,7 +209,7 @@ anthropic_client = (
         timeout=CLAUDE_COACH_TIMEOUT_SECONDS,
         max_retries=0,
     )
-    if ANTHROPIC_API_KEY
+    if ANTHROPIC_API_KEY and claude_mode_available()
     else None
 )
 
@@ -163,8 +231,21 @@ def create_live_gto_router(
         return LiveGTORouter(config)
     if selected_mode == "remote":
         # OCR, hand reconstruction, action validation, and freshness stay on
-        # this machine. Only the compact LiveDecisionState crosses the
-        # authenticated transport to the solve server.
+        # this machine.  HU v2 sends the compact projection; multiway v3 sends
+        # the canonical replayable public transcript plus Hero's private cards.
+        remote_protocol = env.get(
+            "GTO_REMOTE_PROTOCOL",
+            "hu-v2",
+        ).strip().lower()
+        if remote_protocol in {"multiway-v3", "v3", "multiway"}:
+            return RemoteMultiwayClient.from_env(
+                config,
+                environment=env,
+            )
+        if remote_protocol not in {"hu-v2", "v2", "hu"}:
+            raise RemoteGTOConfigurationError(
+                "GTO_REMOTE_PROTOCOL must be 'hu-v2' or 'multiway-v3'"
+            )
         return RemoteGTOClient.from_env(config, environment=env)
     raise LiveGTOConfigurationError(
         "GTO_EXECUTION_MODE must be 'local' or 'remote'"
@@ -1876,6 +1957,91 @@ def reread_total_pot(captures: dict) -> float:
     return parse_total_pot_reread(response.text)
 
 
+def analyze_public_history_frame(
+    captures: dict,
+    *,
+    timeout_seconds: float,
+    client=None,
+) -> GameSnapshot:
+    """Run exactly one bounded Vision request for the continuous decoder.
+
+    This intentionally does not call :func:`analyze_captures`: that manual
+    helper writes shared debug files, may issue a second Pot request, and turns
+    several failures into partial snapshots.  The decoder supplies capture-time
+    identity/timestamp normalization and maps every exception to a gap.
+    """
+
+    selected_client = client if client is not None else gemini_client
+    if selected_client is None:
+        raise RuntimeError("Gemini client is not configured")
+    if timeout_seconds <= 0 or not math.isfinite(timeout_seconds):
+        raise ValueError("timeout_seconds must be finite and positive")
+
+    locally_dealt_seats = detect_locally_dealt_seats(captures)
+    hero_turn_confirmed = detect_hero_action_buttons(captures["buttons"])
+    vision_input, vision_config = build_vision_request(captures)
+    # Leave a small margin for the worker's hard deadline and make retries
+    # explicit.  A provider that ignores this deadline is still isolated and
+    # permanently poisoned by PublicHistoryWorker.
+    provider_timeout_ms = max(
+        1,
+        int(max(0.05, timeout_seconds - 0.1) * 1000),
+    )
+    bounded_config = vision_config.model_copy(
+        update={
+            "http_options": types.HttpOptions(
+                timeout=provider_timeout_ms,
+                retry_options=types.HttpRetryOptions(attempts=1),
+            )
+        }
+    )
+    response = selected_client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=vision_input,
+        config=bounded_config,
+    )
+    if not response.text:
+        raise ValueError("Gemini returned no text content")
+    snapshot = parse_response(
+        response.text,
+        locally_dealt_seats,
+        hero_turn_confirmed=hero_turn_confirmed,
+    )
+    if snapshot.vision_error:
+        raise ValueError(snapshot.vision_error)
+    return snapshot
+
+
+def create_public_history_frame_analyzer(*, client=None):
+    """Bind a decoder-only Gemini client to the one-request analyzer."""
+
+    selected_client = client
+    if selected_client is None:
+        if not GEMINI_API_KEY:
+            raise RuntimeError(
+                "PUBLIC_HISTORY_DECODER_ENABLED requires GEMINI_API_KEY"
+            )
+        # The continuous decoder never shares a client instance with manual
+        # J/L analysis.  Per-call HttpOptions below remain the authoritative
+        # deadline; this default is only a defensive upper bound.
+        selected_client = genai.Client(
+            api_key=GEMINI_API_KEY,
+            http_options=types.HttpOptions(
+                timeout=int(PUBLIC_HISTORY_DECODE_TIMEOUT_SECONDS * 1000),
+                retry_options=types.HttpRetryOptions(attempts=1),
+            ),
+        )
+
+    def analyze(captures, *, timeout_seconds):
+        return analyze_public_history_frame(
+            captures,
+            timeout_seconds=timeout_seconds,
+            client=selected_client,
+        )
+
+    return analyze
+
+
 def analyze_captures(
     comps: dict,
     *,
@@ -1981,6 +2147,237 @@ def analyze_state(
     return snapshot, comps, t_capture, t_vision
 
 
+def active_villain_count(snapshot: GameSnapshot) -> int:
+    """Count opponents who still have live cards in the reconstructed hand."""
+    return sum(
+        1
+        for player in snapshot.players
+        if not player.is_hero and player.status in {"ACTIVE", "ALL_IN"}
+    )
+
+
+def _gto_failure_presentation(
+    snapshot: GameSnapshot,
+    analysis: str,
+) -> Optional[tuple[str, str, str]]:
+    """Translate internal solver failures into concise, actionable UI states."""
+    if not analysis.startswith("Strategy Error:"):
+        return None
+
+    raw_error = analysis.removeprefix("Strategy Error:").strip()
+    if not raw_error.upper().startswith(
+        ("GTO ", "GTO_HU ", "GTO_MULTIWAY ")
+    ):
+        return None
+
+    reason = raw_error.partition(":")[2].strip() or raw_error
+    lowered = reason.lower()
+    villains = active_villain_count(snapshot)
+
+    if "advice discarded" in lowered:
+        return (
+            "ADVICE DISCARDED",
+            "The accepted table state changed while the solver was running, "
+            "so the result was revoked before display. Press J again on the "
+            "current decision.",
+            "bold black on yellow",
+        )
+
+    if (
+        "complete multiway public_hand is unavailable" in lowered
+        or "continuous history has not reached this decision" in lowered
+    ):
+        return (
+            "FULL HISTORY NOT READY",
+            "The multiway solver needs every action from the untouched blinds "
+            "to this exact decision. The validated live history is incomplete, "
+            "so no action was calculated.\nWait for the next fully tracked "
+            "hand; do not use a partial result.",
+            "bold black on yellow",
+        )
+
+    if "gto_multiway requires gto_execution_mode=remote" in lowered:
+        return (
+            "MULTIWAY BACKEND NOT CONNECTED",
+            "The transcript-first multiway client is not configured, so no "
+            "action was calculated. Connect the audited remote v3 backend "
+            "before using multiway mode.",
+            "bold black on yellow",
+        )
+
+    if (
+        "exactly one hu villain" in lowered
+        or "exactly one active villain" in lowered
+    ):
+        if villains > 1:
+            plural = "opponents are" if villains != 1 else "opponent is"
+            return (
+                f"WAIT FOR HEADS-UP ({villains} LEFT)",
+                "The GTO solver supports postflop decisions against exactly "
+                f"1 opponent. {villains} {plural} still active, so no action "
+                "was calculated.\nPress J again when only 1 opponent remains.",
+                "bold black on cyan",
+            )
+        return (
+            "GTO STATE NOT READY",
+            "The solver could not safely identify the single remaining "
+            "opponent, so no action was calculated.\nTake a new snapshot and "
+            "press J on the next decision.",
+            "bold black on yellow",
+        )
+
+    if (
+        "no preflop mixed policy" in lowered
+        or "preflop is not supported" in lowered
+    ):
+        return (
+            "POSTFLOP GTO ONLY",
+            "This solver configuration starts after the flop and only when "
+            "1 opponent remains. Use P for the preflop chart, then press J on "
+            "an eligible postflop decision.",
+            "bold black on cyan",
+        )
+
+    if "folded/third player still has a same-street contribution" in lowered:
+        return (
+            "WAIT FOR NEXT STREET",
+            "A third player's chips are still included in this street, so the "
+            "heads-up solver cannot build a safe starting state yet.\nPress J "
+            "again on the next street.",
+            "bold black on cyan",
+        )
+
+    if "preflop handoff" in lowered or "terminal preflop" in lowered:
+        return (
+            "PREFLOP HISTORY INCOMPLETE",
+            "The solver could not confirm how the hand reached postflop, so it "
+            "safely skipped this decision.\nStart capturing from preflop on "
+            "the next hand.",
+            "bold black on yellow",
+        )
+
+    if any(
+        marker in lowered
+        for marker in (
+            "same-street history",
+            "prior same-street hero decision",
+            "complete public path",
+            "action history",
+        )
+    ):
+        return (
+            "GTO PATH INCOMPLETE",
+            "The complete action sequence for this street was not captured, "
+            "so the solver safely skipped the decision.\nPress J at every Hero "
+            "decision and try again on the next one.",
+            "bold black on yellow",
+        )
+
+    if "gto live is disabled" in lowered or "router is not configured" in lowered:
+        return (
+            "GTO DISABLED",
+            "The solver is not available with the current configuration. No "
+            "action was calculated.",
+            "bold white on red",
+        )
+
+    return (
+        "GTO NOT AVAILABLE",
+        "The solver could not safely map this decision, so no action was "
+        f"calculated.\n[dim]Reason: {reason}[/dim]",
+        "bold black on yellow",
+    )
+
+
+def strategy_display_content(
+    snapshot: GameSnapshot,
+    analysis: str,
+) -> tuple[str, str, str]:
+    """Build the primary recommendation, explanation, and visual severity."""
+    recommendation = "Analyzing..."
+    details = ""
+    style = "bold white on red"
+
+    if not analysis:
+        return recommendation, details, style
+
+    if analysis == "No current Hero decision detected.":
+        return (
+            "WAIT",
+            "No live Hero action buttons were detected. Press J only when it "
+            "is your turn.",
+            "bold black on cyan",
+        )
+
+    solver_failure = _gto_failure_presentation(snapshot, analysis)
+    if solver_failure is not None:
+        return solver_failure
+
+    if analysis == "No Hero Hand Detected." or analysis.startswith(
+        ("Strategy Error:", "Vision Error:")
+    ):
+        return "RETRY", analysis, "bold white on red"
+
+    lines = analysis.split("\n")
+    action_line = next((line for line in lines if "Action:" in line), None)
+    amount_line = next(
+        (line for line in lines if "Amount:" in line or "Size:" in line),
+        None,
+    )
+
+    if action_line:
+        act = action_line.split(":", 1)[1].replace("*", "").strip()
+        amt = ""
+        if amount_line:
+            raw_amt = amount_line.split(":", 1)[1].replace("*", "").strip()
+            normalized_amt = raw_amt.lower().replace(" ", "")
+            if normalized_amt not in {"0", "0bb", "n/a", "na"}:
+                amt = " " + raw_amt
+        recommendation = f"{act}{amt}"
+        reasoning_lines = [
+            line.strip()
+            for line in lines
+            if line.strip().startswith("*")
+        ]
+        details = "\n".join(reasoning_lines)
+    else:
+        recommendation = "Advice received"
+        details = analysis
+
+    rec_upper = recommendation.upper()
+    if "CHECK" in rec_upper or "CALL" in rec_upper:
+        style = "bold black on yellow"
+    elif "RAISE" in rec_upper or "BET" in rec_upper:
+        style = "bold white on green"
+    return recommendation, details, style
+
+
+def visible_strategy_source(source: str) -> str:
+    """Hide verbose failure reasons from the timing header."""
+    if re.match(
+        r"^(?:GTO|GTO_HU|GTO_MULTIWAY) "
+        r"(?:unsupported|failed|unavailable|disabled|cache_miss):",
+        source or "",
+        flags=re.IGNORECASE,
+    ):
+        return ""
+    return source
+
+
+STALE_REASON_LABELS = {
+    "validation capture incomplete": "validation image was incomplete",
+    "board or pot changed": "board or pot changed",
+    "Hero cards changed": "Hero cards changed",
+    "Hero action buttons disappeared": "your turn ended",
+    "Hero action controls changed": "available action or amount changed",
+}
+
+
+def friendly_stale_reasons(reasons: list[str]) -> str:
+    """Translate freshness diagnostics without losing the safety reason."""
+    return ", ".join(STALE_REASON_LABELS.get(reason, reason) for reason in reasons)
+
+
 
 def display_results(
     snapshot: GameSnapshot,
@@ -1995,64 +2392,21 @@ def display_results(
 ):
     """Synthetic display of GameSnapshot data."""
     console.clear()
-    
-    # 1. EXTRACT RECOMMENDATION
-    recommendation = "Analyzing..."
-    details = ""
-    
-    if analysis:
-        if analysis == "No current Hero decision detected.":
-            recommendation = "WAIT"
-            details = analysis
-        elif analysis == "No Hero Hand Detected." or analysis.startswith(
-            ("Strategy Error:", "Vision Error:")
-        ):
-            recommendation = "RETRY"
-            details = analysis
-        lines = analysis.split('\n')
-        action_line = next((line for line in lines if "Action:" in line), None)
-        amount_line = next(
-            (line for line in lines if "Amount:" in line or "Size:" in line),
-            None,
-        )
-        
-        if action_line and analysis != "No current Hero decision detected.":
-            act = action_line.split(":", 1)[1].strip().replace("*", "")
-            amt = ""
-            if amount_line:
-                raw_amt = amount_line.split(":", 1)[1].strip().replace("*", "")
-                normalized_amt = raw_amt.lower().replace(" ", "")
-                if normalized_amt not in {"0", "0bb", "n/a", "na"}:
-                    amt = " " + raw_amt
-            recommendation = f"{act}{amt}"
-            
-            # Extract only the bullet points from reasoning
-            reasoning_lines = [l.strip() for l in lines if l.strip().startswith("*")]
-            details = "\n".join(reasoning_lines)
-        elif (
-            not analysis.startswith(("Strategy Error:", "Vision Error:"))
-            and analysis != "No current Hero decision detected."
-            and analysis != "No Hero Hand Detected."
-        ):
-            recommendation = "Advice received"
-            details = analysis
+    recommendation, details, style = strategy_display_content(snapshot, analysis)
 
     # Header
-    timing_mode = f" | {strategy_source}" if strategy_source and t_strat > 0 else ""
+    timing_label = "GTO" if STRATEGY_BACKEND in SOLVER_STRATEGY_BACKENDS else "Strategy"
     console.print(
-        f"[dim]ID: {snapshot.hand_id} | Total {t_tot:.2f}s{timing_mode} | "
-        f"Capture {t_cap:.2f}s | Vision {t_vis:.2f}s | Strategy {t_strat:.2f}s[/dim]"
+        f"[dim]Hand {snapshot.hand_id} | Total {t_tot:.2f}s | "
+        f"Capture {t_cap:.2f}s | Vision {t_vis:.2f}s | "
+        f"{timing_label} {t_strat:.2f}s[/dim]"
     )
+    source_label = visible_strategy_source(strategy_source)
+    if source_label and t_strat > 0:
+        console.print(f"[dim]Solver source: {source_label}[/dim]")
 
     # ★ RECOMMENDATION PANEL ★
     if analysis:
-        style = "bold white on red"
-        rec_upper = recommendation.upper()
-        if "FOLD" in rec_upper: style = "bold white on red"
-        elif "CHECK" in rec_upper or "CALL" in rec_upper: style = "bold black on yellow"
-        elif "RAISE" in rec_upper or "BET" in rec_upper: style = "bold white on green"
-        elif "WAIT" in rec_upper: style = "bold black on cyan"
-        elif "RETRY" in rec_upper: style = "bold white on red"
         console.print(Panel(Align.center(f"[bold]{recommendation}[/bold]"), style=style))
 
     # HUD Table
@@ -2121,18 +2475,27 @@ def display_stale_result(
 ):
     """Show a neutral warning without rendering an obsolete poker action."""
     console.clear()
-    timing_mode = f" | {strategy_source}" if strategy_source and t_strat > 0 else ""
+    timing_label = "GTO" if STRATEGY_BACKEND in SOLVER_STRATEGY_BACKENDS else "Strategy"
     console.print(
-        f"[dim]TABLE CHANGED | Total {t_tot:.2f}s{timing_mode} | Capture {t_cap:.2f}s | "
-        f"Vision {t_vis:.2f}s | Strategy {t_strat:.2f}s[/dim]"
+        f"[dim]DECISION CHANGED | Total {t_tot:.2f}s | "
+        f"Capture {t_cap:.2f}s | Vision {t_vis:.2f}s | "
+        f"{timing_label} {t_strat:.2f}s[/dim]"
     )
-    reason_text = ", ".join(reasons)
+    reason_text = friendly_stale_reasons(reasons)
+    if "Hero action buttons disappeared" in reasons:
+        next_step = "Your turn ended. Wait for the next decision."
+    else:
+        next_step = (
+            "If action buttons are still visible, press J once to analyze the "
+            "new decision. Otherwise wait."
+        )
     console.print(
         Panel(
             Align.center(
-                "[bold]ADVICE DISCARDED[/bold]\n"
-                "The table changed while analysis was running. Press J again "
-                f"on the current decision.\n[dim]{reason_text}[/dim]"
+                "[bold]NO ACTION SHOWN[/bold]\n"
+                "The decision changed before analysis finished, so the old "
+                "result is no longer valid.\n"
+                f"[bold]Changed:[/bold] {reason_text}\n{next_step}"
             ),
             style="bold black on yellow",
         )
@@ -2155,7 +2518,398 @@ input_mode = None
 note_player = ""
 current_history = HandHistory()  # Accumulates snapshots for current hand
 recorder = None  # Initialized in main to keep imports side-effect free
+live_capture_service = None  # Optional local-CV observer; no OCR/model calls.
+public_history_runtime = None  # Optional semantic decoder; explicit opt-in.
 analysis_lock = threading.Lock()
+
+
+def create_live_capture_service(monitor: int) -> ContinuousCaptureService:
+    """Create the opt-in observer sampler for calibrated table regions."""
+
+    source = MSSRegionFrameSource(
+        monitor,
+        {**SEAT_ZONES, "buttons": BUTTONS_REGION},
+    )
+    detector = KeyframeDetector(
+        heartbeat_interval_ns=round(
+            LIVE_CAPTURE_HEARTBEAT_SECONDS * 1_000_000_000
+        ),
+    )
+    return ContinuousCaptureService(
+        source,
+        detector=detector,
+        ring=KeyframeRing(LIVE_CAPTURE_MAX_PENDING),
+        fps=LIVE_CAPTURE_FPS,
+    )
+
+
+def create_continuous_public_history_runtime(
+    monitor: int,
+    *,
+    analyze_frame=None,
+) -> ContinuousPublicHistoryRuntime:
+    """Build the opt-in capture -> decoder -> transactional history path."""
+
+    capture_service = create_live_capture_service(monitor)
+    coordinator = PublicHistoryCoordinator()
+    decoder = ContinuousPublicHistoryDecoder(
+        analyze_frame=analyze_frame or create_public_history_frame_analyzer(),
+        validate_snapshot=lambda snapshot: validate_snapshot_candidate(
+            snapshot,
+            require_hero_hand=False,
+        ),
+    )
+    worker = PublicHistoryWorker(
+        ring=capture_service.ring,
+        coordinator=coordinator,
+        decoder=decoder,
+        decode_timeout_seconds=PUBLIC_HISTORY_DECODE_TIMEOUT_SECONDS,
+        idle_wait_seconds=0.05,
+    )
+    return ContinuousPublicHistoryRuntime(
+        capture_service=capture_service,
+        coordinator=coordinator,
+        worker=worker,
+    )
+
+
+@dataclass(frozen=True)
+class AcceptedMultiwayStrategyHistory:
+    """History facade backed only by one coordinator-accepted bundle."""
+
+    snapshots: tuple[GameSnapshot, ...]
+    public_hand: PublicHandHistory
+    public_hand_error: str = ""
+
+
+@dataclass(frozen=True)
+class AcceptedMultiwayDecisionToken:
+    """Revocable semantic decision token, independent of heartbeat frame IDs."""
+
+    frame_id: int
+    public_hand: PublicHandHistory
+    decision_fingerprint: str
+
+
+def _accepted_decision_fingerprint(snapshot: GameSnapshot) -> str:
+    """Hash stable decision identity while excluding capture time/overlays."""
+
+    occupied = []
+    for player in snapshot.players:
+        if player.status in {"EMPTY", "SITTING_OUT"}:
+            continue
+        try:
+            position = canonical_preflop_position(player.name)
+        except PreflopObservationError:
+            position = str(player.name or "").strip().upper()
+        occupied.append(
+            {
+                "seat": player.seat_index,
+                "position": position,
+                "status": player.status,
+                "hero": bool(player.is_hero),
+                "hero_combo": (
+                    sorted(player.hole_cards or [])
+                    if player.is_hero
+                    else []
+                ),
+            }
+        )
+    identity = {
+        "dealer": snapshot.dealer_seat_index,
+        "street": snapshot.meta_info.current_street,
+        "board": list(snapshot.board_state.community_cards),
+        "action_on": snapshot.action_on_seat_index,
+        "occupied": sorted(occupied, key=lambda item: item["seat"]),
+        "hero_options": sorted(
+            canonical_poker_action(option)
+            for option in snapshot.last_action_context.hero_action_options
+            if canonical_poker_action(option)
+        ),
+    }
+    return hashlib.sha256(
+        json.dumps(
+            identity,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def accepted_multiway_strategy_input(
+    current_fresh_snapshot: GameSnapshot,
+    runtime: ContinuousPublicHistoryRuntime | None = None,
+) -> tuple[
+    GameSnapshot,
+    AcceptedMultiwayStrategyHistory,
+    AcceptedMultiwayDecisionToken,
+]:
+    """Return one exact accepted snapshot/transcript pair or fail closed."""
+
+    selected_runtime = runtime or public_history_runtime
+    if selected_runtime is None:
+        raise MultiwayProtocolError(
+            "continuous history has not reached this decision: "
+            "public-history decoder is not running"
+        )
+    healthy = getattr(selected_runtime, "is_healthy", False)
+    if callable(healthy):
+        healthy = healthy()
+    if not healthy:
+        health_error = str(
+            getattr(selected_runtime, "health_error", "")
+            or "continuous capture/decoder is not healthy"
+        )
+        try:
+            selected_runtime.coordinator.invalidate_gap(
+                health_error
+            )
+        except Exception as invalidate_error:
+            health_error += (
+                "; fail-closed invalidation failed: "
+                f"{type(invalidate_error).__name__}: {invalidate_error}"
+            )
+        raise MultiwayProtocolError(
+            "continuous history has not reached this decision: "
+            + health_error
+        )
+    caught_up_reader = getattr(
+        selected_runtime,
+        "accepted_frame_if_caught_up",
+        None,
+    )
+    if not callable(caught_up_reader):
+        raise MultiwayProtocolError(
+            "continuous history has not reached this decision: "
+            "runtime does not provide the required caught-up ledger gate"
+        )
+    caught_up = caught_up_reader()
+    if not getattr(caught_up, "ready", False):
+        detail = str(
+            getattr(caught_up, "reason", "")
+            or "worker has not consumed the current capture ledger"
+        )
+        raise MultiwayProtocolError(
+            "continuous history has not reached this decision: " + detail
+        )
+    accepted = getattr(caught_up, "accepted_frame", None)
+    if not isinstance(accepted, AcceptedPublicHistoryFrame):
+        raise MultiwayProtocolError(
+            "continuous history caught-up gate returned an invalid bundle"
+        )
+    accepted_snapshot = accepted.snapshot
+    if not isinstance(accepted_snapshot, GameSnapshot):
+        raise MultiwayProtocolError(
+            "continuous history accepted an unsupported snapshot type"
+        )
+    accepted_errors = validate_snapshot_candidate(
+        accepted_snapshot,
+        require_hero_hand=True,
+    )
+    if accepted_errors:
+        raise MultiwayProtocolError(
+            "continuous accepted snapshot is invalid for strategy: "
+            + "; ".join(accepted_errors)
+        )
+    if (
+        accepted_snapshot.action_on_seat_index != 4
+        or not accepted_snapshot.last_action_context.hero_action_options
+    ):
+        raise MultiwayProtocolError(
+            "continuous history has not reached this decision: "
+            "accepted frame does not prove a current Hero action"
+        )
+
+    # The J flow's fresh capture remains the strategy/display frame.  Binding
+    # only its hand ID to the exact accepted transcript lets the multiway
+    # builder replay and compare every public field; any stale or mixed state
+    # raises before the solver transport is called.
+    if not isinstance(current_fresh_snapshot, GameSnapshot):
+        raise MultiwayProtocolError(
+            "current strategy frame has an unsupported snapshot type"
+        )
+    snapshot = deepcopy(current_fresh_snapshot)
+    fresh_errors = validate_snapshot_candidate(
+        snapshot,
+        require_hero_hand=True,
+    )
+    if fresh_errors:
+        raise MultiwayProtocolError(
+            "current strategy frame is invalid: " + "; ".join(fresh_errors)
+        )
+    if (
+        snapshot.action_on_seat_index != 4
+        or not snapshot.last_action_context.hero_action_options
+    ):
+        raise MultiwayProtocolError(
+            "current strategy frame does not prove a Hero decision"
+        )
+
+    if snapshot.dealer_seat_index != accepted_snapshot.dealer_seat_index:
+        raise MultiwayProtocolError(
+            "current strategy frame dealer differs from the latest accepted "
+            "frame"
+        )
+
+    def position_map(candidate: GameSnapshot) -> dict[int, str]:
+        result = {}
+        for player in candidate.players:
+            if player.status in {"EMPTY", "SITTING_OUT"}:
+                continue
+            try:
+                position = canonical_preflop_position(player.name)
+            except PreflopObservationError as error:
+                raise MultiwayProtocolError(
+                    f"seat {player.seat_index} position is not canonical"
+                ) from error
+            if player.seat_index in result:
+                raise MultiwayProtocolError(
+                    "strategy frame contains duplicate occupied seats"
+                )
+            result[player.seat_index] = position
+        return result
+
+    if position_map(snapshot) != position_map(accepted_snapshot):
+        raise MultiwayProtocolError(
+            "current strategy frame seat positions differ from the latest "
+            "accepted frame"
+        )
+    accepted_hero = next(
+        (player for player in accepted_snapshot.players if player.is_hero),
+        None,
+    )
+    fresh_hero = next(
+        (player for player in snapshot.players if player.is_hero),
+        None,
+    )
+    accepted_combo = tuple(
+        sorted((accepted_hero.hole_cards if accepted_hero else None) or ())
+    )
+    fresh_combo = tuple(
+        sorted((fresh_hero.hole_cards if fresh_hero else None) or ())
+    )
+    if (
+        len(accepted_combo) != 2
+        or len(fresh_combo) != 2
+        or accepted_combo != fresh_combo
+    ):
+        raise MultiwayProtocolError(
+            "current strategy frame Hero combo differs from the latest "
+            "accepted frame"
+        )
+
+    snapshot.hand_id = accepted.history.hand_id
+    return (
+        snapshot,
+        AcceptedMultiwayStrategyHistory(
+            snapshots=(snapshot,),
+            public_hand=accepted.history,
+        ),
+        AcceptedMultiwayDecisionToken(
+            frame_id=accepted.frame_id,
+            public_hand=accepted.history,
+            decision_fingerprint=_accepted_decision_fingerprint(
+                accepted_snapshot
+            ),
+        ),
+    )
+
+
+def continuous_multiway_token_status(
+    token: AcceptedMultiwayDecisionToken,
+    runtime: ContinuousPublicHistoryRuntime | None = None,
+) -> tuple[bool, str]:
+    """Revalidate a semantic token against the latest healthy observation."""
+
+    if not isinstance(token, AcceptedMultiwayDecisionToken):
+        return False, "continuous decision token is invalid"
+    selected_runtime = runtime or public_history_runtime
+    if selected_runtime is None:
+        return False, "public-history decoder is not running"
+    healthy = getattr(selected_runtime, "is_healthy", False)
+    if callable(healthy):
+        healthy = healthy()
+    if not healthy:
+        reason = str(
+            getattr(selected_runtime, "health_error", "")
+            or "continuous capture/decoder is not healthy"
+        )
+        try:
+            selected_runtime.coordinator.invalidate_gap(reason)
+        except Exception as error:
+            reason += (
+                "; fail-closed invalidation failed: "
+                f"{type(error).__name__}: {error}"
+            )
+        return False, reason
+    caught_up_reader = getattr(
+        selected_runtime,
+        "accepted_frame_if_caught_up",
+        None,
+    )
+    if not callable(caught_up_reader):
+        return False, "runtime lacks the required caught-up ledger gate"
+    caught_up = caught_up_reader()
+    if not getattr(caught_up, "ready", False):
+        return (
+            False,
+            str(
+                getattr(caught_up, "reason", "")
+                or "worker has not consumed the current capture ledger"
+            ),
+        )
+    latest = getattr(caught_up, "accepted_frame", None)
+    if not isinstance(latest, AcceptedPublicHistoryFrame):
+        return False, "caught-up ledger gate returned an invalid bundle"
+    if latest.history != token.public_hand:
+        return False, "accepted public history changed"
+    if (
+        _accepted_decision_fingerprint(latest.snapshot)
+        != token.decision_fingerprint
+    ):
+        return False, "accepted Hero decision changed"
+    return True, ""
+
+
+def evaluate_continuous_multiway_strategy(
+    snapshot: GameSnapshot,
+    history: AcceptedMultiwayStrategyHistory,
+    token: AcceptedMultiwayDecisionToken,
+    *,
+    mode: Optional[str] = None,
+    runtime: ContinuousPublicHistoryRuntime | None = None,
+    evaluator=None,
+):
+    """Evaluate only while the accepted decision token remains current."""
+
+    ready, reason = continuous_multiway_token_status(token, runtime)
+    if not ready:
+        raise MultiwayProtocolError(
+            "continuous history changed before solver request: " + reason
+        )
+    if evaluator is None:
+        result = evaluate_strategy_backend(
+            snapshot,
+            history,
+            mode=mode,
+            _continuous_token=token,
+            _continuous_runtime=runtime,
+        )
+    else:
+        result = evaluator(
+            snapshot,
+            history,
+            mode=mode,
+        )
+    ready, reason = continuous_multiway_token_status(token, runtime)
+    if not ready:
+        raise MultiwayProtocolError(
+            "ADVICE DISCARDED: continuous history changed during solve "
+            f"({reason}); retry on the current decision"
+        )
+    return result
 
 
 def preserve_hero_cards_on_continuing_board(
@@ -4567,6 +5321,153 @@ def _live_same_street_root(
     return None
 
 
+def build_multiway_solver_state(
+    snapshot: GameSnapshot,
+    history: HandHistory,
+    prepared: PreparedStrategyState,
+) -> MultiwayDecisionState:
+    """Build a transcript-first v3 decision with no HU-shaped projections."""
+
+    public_hand = history.public_hand
+    if public_hand is None:
+        detail = (
+            history.public_hand_error.strip()
+            or "continuous history has not reached this decision"
+        )
+        raise MultiwayProtocolError(
+            "complete multiway public_hand is unavailable: " + detail
+        )
+    replayed = replay_public_hand(public_hand)
+    hero = prepared.hero
+    if snapshot.hand_id != public_hand.hand_id:
+        raise MultiwayProtocolError(
+            "latest snapshot and public_hand have different hand IDs"
+        )
+    if snapshot.dealer_seat_index != public_hand.button_seat:
+        raise MultiwayProtocolError(
+            "latest snapshot dealer differs from public_hand button seat"
+        )
+    if replayed.actor_seat != hero.seat_index:
+        raise MultiwayProtocolError(
+            "public_hand does not have action on the captured Hero seat"
+        )
+    if replayed.street != snapshot.meta_info.current_street:
+        raise MultiwayProtocolError(
+            "latest snapshot street differs from public_hand replay"
+        )
+    if replayed.board != tuple(snapshot.board_state.community_cards):
+        raise MultiwayProtocolError(
+            "latest snapshot board differs from public_hand replay"
+        )
+
+    tolerance = Decimal("0.05")
+
+    def close(left: Decimal, right: object) -> bool:
+        try:
+            observed = Decimal(str(right))
+        except (ValueError, TypeError):
+            return False
+        return observed.is_finite() and abs(left - observed) <= tolerance
+
+    if not close(replayed.pot_bb, snapshot.board_state.total_pot):
+        raise MultiwayProtocolError(
+            "latest snapshot pot differs from public_hand replay"
+        )
+    by_seat = {
+        player.seat_index: player
+        for player in snapshot.players
+        if player.status not in {"EMPTY", "SITTING_OUT"}
+    }
+    expected_positions = {
+        seat.seat: seat.position
+        for seat in public_hand.seats
+    }
+    expected_seats = set(expected_positions)
+    if set(by_seat) != expected_seats:
+        raise MultiwayProtocolError(
+            "latest occupied seats differ from public_hand"
+        )
+    for seat in expected_seats:
+        player = by_seat[seat]
+        try:
+            observed_position = canonical_preflop_position(player.name)
+        except PreflopObservationError as error:
+            raise MultiwayProtocolError(
+                f"seat {seat} position is not canonical"
+            ) from error
+        if observed_position != expected_positions[seat]:
+            raise MultiwayProtocolError(
+                f"seat {seat} position differs from public_hand"
+            )
+        if not close(replayed.stack_map[seat], player.stack_size):
+            raise MultiwayProtocolError(
+                f"seat {seat} stack differs from public_hand replay"
+            )
+        if not close(
+            replayed.street_contribution_map[seat],
+            player.current_bet,
+        ):
+            raise MultiwayProtocolError(
+                f"seat {seat} current bet differs from public_hand replay"
+            )
+        expected_status = (
+            "FOLDED"
+            if seat in replayed.folded
+            else "ALL_IN"
+            if seat in replayed.all_in
+            else "ACTIVE"
+        )
+        if player.status != expected_status:
+            raise MultiwayProtocolError(
+                f"seat {seat} status differs from public_hand replay"
+            )
+    if not close(
+        replayed.amount_to_call_bb,
+        snapshot.last_action_context.amount_to_call,
+    ):
+        raise MultiwayProtocolError(
+            "latest call amount differs from public_hand replay"
+        )
+
+    captured_actions = {
+        {
+            "BET": "BET_TO",
+            "RAISE": "RAISE_TO",
+            "ALL-IN": "ALL_IN_TO",
+        }.get(canonical_poker_action(action), canonical_poker_action(action))
+        for action in snapshot.last_action_context.hero_action_options
+    }
+    captured_actions.discard("")
+    replay_actions = set(replayed.legal_actions)
+    if not captured_actions or not captured_actions <= replay_actions:
+        raise MultiwayProtocolError(
+            "latest Hero controls contradict public_hand legal actions"
+        )
+
+    capture_identity = {
+        "hand_id": public_hand.hand_id,
+        "event_count": len(public_hand.events),
+        "snapshot_timestamp": snapshot.timestamp,
+        "hero_seat": hero.seat_index,
+        "hero_combo": list(hero.hole_cards or ()),
+    }
+    capture_id = hashlib.sha256(
+        json.dumps(
+            capture_identity,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return MultiwayDecisionState(
+        public_hand=public_hand,
+        hero_seat=hero.seat_index,
+        hero_combo=tuple(hero.hole_cards),
+        capture_id=capture_id,
+    )
+
+
 def build_live_gto_state(
     snapshot: GameSnapshot,
     history: HandHistory,
@@ -4762,6 +5663,143 @@ def build_live_gto_state(
     )
 
 
+def gto_hu_position_continuity_state(
+    state: LiveDecisionState,
+    history: HandHistory,
+) -> LiveDecisionState:
+    """Use same-hand seat continuity when static charts need no wager path.
+
+    This fallback is intentionally bounded to the approximate GTO_HU chart
+    route. It never fabricates a terminal betting history: the observation
+    remains non-terminal and records its position-only provenance.
+    """
+
+    if (
+        state.street.upper() == "PREFLOP"
+        or state.public_hand is not None
+        or not state.preflop_mapping_error
+    ):
+        return state
+
+    indexed_preflop = next(
+        (
+            (index, candidate)
+            for index, candidate in reversed(
+                list(enumerate(history.snapshots))
+            )
+            if candidate.hand_id == state.hand_id
+            and candidate.meta_info.current_street == "PREFLOP"
+        ),
+        None,
+    )
+    if indexed_preflop is None:
+        return state
+    preflop_index, preflop = indexed_preflop
+
+    def occupied_layout(snapshot: GameSnapshot) -> dict[int, str]:
+        layout = {}
+        for player in snapshot.players:
+            if player.status in {"EMPTY", "SITTING_OUT"}:
+                continue
+            try:
+                position = canonical_preflop_position(player.name)
+            except PreflopObservationError:
+                return {}
+            if player.seat_index in layout or position in layout.values():
+                return {}
+            layout[player.seat_index] = position
+        return layout
+
+    preflop_layout = occupied_layout(preflop)
+    current = history.snapshots[-1] if history.snapshots else None
+    current_layout = occupied_layout(current) if current is not None else {}
+    if (
+        len(preflop_layout) != 6
+        or set(preflop_layout.values()) != set(PROVIDER_POSITIONS)
+        or preflop_layout != current_layout
+        or preflop.dealer_seat_index != current.dealer_seat_index
+    ):
+        return state
+
+    try:
+        hero_position = canonical_preflop_position(state.hero_position)
+        villain_position = canonical_preflop_position(state.villain_position)
+    except PreflopObservationError:
+        return state
+    if hero_position == villain_position:
+        return state
+
+    contributions = {}
+    initial_stacks = {}
+    folded = set()
+    all_in = set()
+    for player in preflop.players:
+        if player.status in {"EMPTY", "SITTING_OUT"}:
+            continue
+        position = canonical_preflop_position(player.name)
+        stack = Decimal(str(player.stack_size))
+        contribution = Decimal(str(player.current_bet))
+        if (
+            not stack.is_finite()
+            or not contribution.is_finite()
+            or stack < 0
+            or contribution < 0
+        ):
+            return state
+        contributions[position] = contribution
+        initial_stacks[position] = stack + contribution
+        if player.status == "FOLDED":
+            folded.add(position)
+        elif player.status == "ALL_IN":
+            all_in.add(position)
+
+    visible_survivors = set(PROVIDER_POSITIONS) - folded
+    if not {hero_position, villain_position}.issubset(visible_survivors):
+        return state
+
+    observation = ObservedPreflopState(
+        actor=None,
+        contributions=tuple(
+            (position, contributions[position])
+            for position in PROVIDER_POSITIONS
+        ),
+        folded=frozenset(folded),
+        initial_stacks=tuple(
+            (position, initial_stacks[position])
+            for position in PROVIDER_POSITIONS
+        ),
+        terminal=False,
+        provenance=ObservationProvenance(
+            source=POSITION_ONLY_HANDOFF_SOURCE,
+            preflop_index=preflop_index,
+            hand_id=state.hand_id,
+        ),
+        all_in=frozenset(all_in),
+    )
+    return dataclasses.replace(
+        state,
+        preflop_observation=observation,
+        preflop_mapping_error="",
+    )
+
+
+def should_use_gto_hu_position_continuity(
+    backend: str,
+    router,
+    state: LiveDecisionState,
+) -> bool:
+    """Keep the position-only fallback explicit and solver-profile scoped."""
+
+    config = getattr(router, "config", None)
+    range_source = str(getattr(config, "range_source", "")).strip().lower()
+    return (
+        backend == "GTO_HU"
+        and range_source == "charts"
+        and state.public_hand is None
+        and bool(state.preflop_mapping_error)
+    )
+
+
 def evaluate_strategy_backend(
     snapshot: GameSnapshot,
     history: HandHistory,
@@ -4770,6 +5808,8 @@ def evaluate_strategy_backend(
     backend: Optional[str] = None,
     router: Optional[LiveGTORouter] = None,
     client=None,
+    _continuous_token: AcceptedMultiwayDecisionToken | None = None,
+    _continuous_runtime: ContinuousPublicHistoryRuntime | None = None,
 ) -> StrategyEvaluation:
     """Route strategy without ever allowing an implicit Claude fallback."""
 
@@ -4785,10 +5825,66 @@ def evaluate_strategy_backend(
     if selected_router is None:
         reason = live_gto_config_error or "live GTO router is not configured"
         outcome = None
+    elif isinstance(selected_router, RemoteMultiwayClient):
+        token_ready, token_reason = continuous_multiway_token_status(
+            _continuous_token,
+            _continuous_runtime,
+        )
+        if (
+            not isinstance(history, AcceptedMultiwayStrategyHistory)
+            or _continuous_token is None
+            or history.public_hand != _continuous_token.public_hand
+            or not token_ready
+        ):
+            outcome = None
+            reason = (
+                "multiway-v3 requires a current coordinator-accepted "
+                "snapshot/history token; legacy manual history is forbidden"
+            )
+            if token_reason:
+                reason += ": " + token_reason
+        else:
+            try:
+                live_state = build_multiway_solver_state(
+                    snapshot,
+                    history,
+                    prepared,
+                )
+                outcome = selected_router.evaluate(live_state)
+                reason = outcome.reason
+            except MultiwayProtocolError as error:
+                outcome = None
+                reason = str(error)
+    elif (
+        selected_backend == "GTO_MULTIWAY"
+        and not isinstance(selected_router, RemoteMultiwayClient)
+    ):
+        outcome = None
+        reason = (
+            "GTO_MULTIWAY requires GTO_EXECUTION_MODE=remote and "
+            "GTO_REMOTE_PROTOCOL=multiway-v3"
+        )
     else:
-        live_state = build_live_gto_state(snapshot, history, prepared)
-        outcome = selected_router.evaluate(live_state)
-        reason = outcome.reason
+        try:
+            live_state = build_live_gto_state(
+                snapshot,
+                history,
+                prepared,
+            )
+            if should_use_gto_hu_position_continuity(
+                selected_backend,
+                selected_router,
+                live_state,
+            ):
+                live_state = gto_hu_position_continuity_state(
+                    live_state,
+                    history,
+                )
+            outcome = selected_router.evaluate(live_state)
+            reason = outcome.reason
+        except MultiwayProtocolError as error:
+            outcome = None
+            reason = str(error)
 
     if outcome is not None and outcome.solved:
         approximate = bool(getattr(outcome, "approximate", False)) or (
@@ -4849,7 +5945,13 @@ def evaluate_strategy_backend(
         if outcome is not None
         else "unavailable"
     )
-    solver_label = "GTO_HU" if selected_backend == "GTO_HU" else "GTO"
+    solver_label = (
+        "GTO_HU"
+        if selected_backend == "GTO_HU"
+        else "GTO_MULTIWAY"
+        if selected_backend == "GTO_MULTIWAY"
+        else "GTO"
+    )
     fallback_reason = f"{solver_label} {status}: {reason}"
     if selected_backend == "HYBRID":
         fallback = evaluate_strategy_snapshot(
@@ -4903,6 +6005,7 @@ def run_analysis_flow(mode: str = "debug"):
         # 1. Capture & Vision
         t_vision = 0.0
         validated_captures = None
+        raw_validated_fresh_snapshot = None
         snapshot, comps, t_capture, t_vision = analyze_state(
             monitor_num,
             require_hero_turn=(mode == "strategy"),
@@ -4921,6 +6024,12 @@ def run_analysis_flow(mode: str = "debug"):
                 t_total,
             )
             return
+
+        if mode == "strategy":
+            # Keep the exact J-frame before any legacy history repair can
+            # rewrite cards, positions, statuses, board, or hand identity.
+            # Multiway-v3 validates and compares only this raw observation.
+            raw_validated_fresh_snapshot = deepcopy(snapshot)
 
         # Validate the candidate before it can reset or mutate hand history.
         # A street transition during vision discards the entire observation.
@@ -5036,6 +6145,7 @@ def run_analysis_flow(mode: str = "debug"):
         strategy_source = ""
         metrics = None
         hand_rank = ""  # Initialize here to avoid reference error
+        final_continuous_token = None
         
         # 3. Strategy (Optional) - Uses FULL HISTORY
         if mode == "strategy":
@@ -5049,47 +6159,123 @@ def run_analysis_flow(mode: str = "debug"):
             ):
                 analysis = "No current Hero decision detected."
             else:
-                strategy_result = evaluate_strategy_backend(
-                    snapshot,
-                    current_history,
-                    mode=PROMPT_MODE,
+                strategy_snapshot = snapshot
+                strategy_history = current_history
+                pairing_error = ""
+                accepted_token = None
+                requires_continuous_history = (
+                    STRATEGY_BACKEND == "GTO_MULTIWAY"
+                    or isinstance(live_gto_router, RemoteMultiwayClient)
                 )
-                analysis = strategy_result.final_analysis
-                metrics = strategy_result.metrics
-                hand_rank = strategy_result.hand_rank
-                t_strategy = strategy_result.latency_seconds
-                strategy_source = strategy_result.source
-                strategy_prompt = strategy_result.prompt
+                if requires_continuous_history:
+                    if not PUBLIC_HISTORY_DECODER_ENABLED:
+                        pairing_error = (
+                            "continuous history has not reached this decision: "
+                            "PUBLIC_HISTORY_DECODER_ENABLED=1 is required for "
+                            "every multiway-v3 route"
+                        )
+                    else:
+                        try:
+                            (
+                                strategy_snapshot,
+                                strategy_history,
+                                accepted_token,
+                            ) = accepted_multiway_strategy_input(
+                                raw_validated_fresh_snapshot
+                            )
+                        except MultiwayProtocolError as error:
+                            pairing_error = str(error)
 
-                with open("debug_strategy_prompt.txt", "w") as f:
-                    f.write(strategy_prompt)
-                with open("debug_strategy_response.txt", "w") as f:
-                    f.write(analysis)
+                strategy_result = None
+                if not pairing_error:
+                    try:
+                        if requires_continuous_history:
+                            strategy_result = (
+                                evaluate_continuous_multiway_strategy(
+                                    strategy_snapshot,
+                                    strategy_history,
+                                    accepted_token,
+                                    mode=PROMPT_MODE,
+                                )
+                            )
+                        else:
+                            strategy_result = evaluate_strategy_backend(
+                                strategy_snapshot,
+                                strategy_history,
+                                mode=PROMPT_MODE,
+                            )
+                    except MultiwayProtocolError as error:
+                        pairing_error = str(error)
 
-                final_captures = capture_validation_regions(monitor_num)
-                stale_reasons = table_state_change_reasons(
-                    validated_captures, final_captures
-                )
-                if stale_reasons:
-                    save_stale_debug_capture(
-                        validated_captures,
-                        final_captures,
-                        stale_reasons,
-                        "before_display",
+                if pairing_error:
+                    analysis = (
+                        "Strategy Error: GTO_MULTIWAY unavailable: "
+                        + pairing_error
                     )
-                    t_total = time.time() - start_total
-                    display_stale_result(
-                        t_capture,
-                        t_vision,
-                        t_strategy,
-                        t_total,
-                        stale_reasons,
-                        strategy_source,
+                    strategy_source = pairing_error
+                else:
+                    # The manual J snapshot is replay-checked against the
+                    # accepted transcript, and the semantic token is checked
+                    # immediately before and after the solver transport.
+                    assert strategy_result is not None
+                    analysis = strategy_result.final_analysis
+                    metrics = strategy_result.metrics
+                    hand_rank = strategy_result.hand_rank
+                    t_strategy = strategy_result.latency_seconds
+                    strategy_source = strategy_result.source
+                    strategy_prompt = strategy_result.prompt
+
+                    with open("debug_strategy_prompt.txt", "w") as f:
+                        f.write(strategy_prompt)
+                    with open("debug_strategy_response.txt", "w") as f:
+                        f.write(analysis)
+
+                    final_captures = capture_validation_regions(monitor_num)
+                    stale_reasons = table_state_change_reasons(
+                        validated_captures, final_captures
                     )
-                    return
+                    if stale_reasons:
+                        save_stale_debug_capture(
+                            validated_captures,
+                            final_captures,
+                            stale_reasons,
+                            "before_display",
+                        )
+                        t_total = time.time() - start_total
+                        display_stale_result(
+                            t_capture,
+                            t_vision,
+                            t_strategy,
+                            t_total,
+                            stale_reasons,
+                            strategy_source,
+                        )
+                        return
+                    if requires_continuous_history:
+                        final_continuous_token = accepted_token
 
         t_total = time.time() - start_total
-        
+
+        # The solver post-check happens before the final pixel guard above.
+        # Recheck once more at the actual display boundary so an accepted
+        # transcript revoked during that last capture can never yield advice.
+        if final_continuous_token is not None:
+            token_ready, token_reason = continuous_multiway_token_status(
+                final_continuous_token
+            )
+            if not token_ready:
+                discard_reason = (
+                    "ADVICE DISCARDED: continuous history changed before "
+                    f"display ({token_reason}); retry on the current decision"
+                )
+                analysis = (
+                    "Strategy Error: GTO_MULTIWAY unavailable: "
+                    + discard_reason
+                )
+                strategy_source = discard_reason
+                metrics = None
+                hand_rank = ""
+
         # 4. Display
         display_results(
             snapshot,
@@ -5127,7 +6313,7 @@ def start_analysis_flow(mode: str) -> None:
 
 
 def on_press(key):
-    global running, input_mode, note_player
+    global running, input_mode, note_player, PROMPT_MODE
     try:
         if hasattr(key, 'char') and key.char:
             char = key.char.lower()
@@ -5158,11 +6344,15 @@ def on_press(key):
                 current_history.reset()
                 console.print("\n[bold green]🆕 HAND HISTORY RESET - Ready for new hand![/bold green]")
             elif char == 'm':
+                if not claude_mode_available():
+                    console.print(
+                        "[dim]GTO-only mode: Claude controls are disabled.[/dim]"
+                    )
+                    return
                 if analysis_lock.locked():
                     console.print("[dim]Analysis running; mode key ignored.[/dim]")
                     return
                 # Toggle Prompt Mode
-                global PROMPT_MODE
                 if PROMPT_MODE == "COACH":
                     PROMPT_MODE = "FAST"
                 else:
@@ -5188,7 +6378,7 @@ def on_press(key):
 
 
 def main():
-    global monitor_num, recorder
+    global monitor_num, recorder, live_capture_service, public_history_runtime
 
     if recorder is None:
         recorder = GameRecorder()
@@ -5208,17 +6398,82 @@ def main():
     
     console.print(f"\n[bold green]♠ Poker Range Assistant ♠[/bold green]")
     console.print(f"[white]Monitor: {monitor_num}[/white]")
+    if claude_mode_available():
+        console.print(
+            f"[white]Mode: {PROMPT_MODE} | Backend: {STRATEGY_BACKEND}[/white]"
+        )
+        mode_control = " | 'm' CLAUDE MODE"
+    else:
+        console.print(
+            f"[white]Strategy: GTO ONLY | Backend: {STRATEGY_BACKEND} | "
+            "Claude: OFF[/white]"
+        )
+        if STRATEGY_BACKEND == "GTO_HU":
+            console.print(
+                "[dim]Coverage: postflop when exactly 1 opponent remains[/dim]"
+            )
+        elif (
+            STRATEGY_BACKEND == "GTO_MULTIWAY"
+            or isinstance(live_gto_router, RemoteMultiwayClient)
+        ):
+            console.print(
+                "[dim]Coverage: transcript-first multiway v3; advice is shown "
+                "only with a gap-free hand history[/dim]"
+            )
+        mode_control = ""
     console.print(
-        f"[white]Mode: {PROMPT_MODE} | Backend: {STRATEGY_BACKEND}[/white]"
+        "[yellow]'j' GTO ADVICE | 'l' SNAPSHOT | 'n' NEW HAND | "
+        f"'p' CHART{mode_control} | ESC quit[/yellow]\n"
     )
-    console.print(
-        "[yellow]'l' SNAPSHOT | 'j' CAPTURE + AUTO ROUTE | 'n' NEW HAND | "
-        "'p' CHART | 'm' CLAUDE MODE | ESC quit[/yellow]\n"
-    )
-    
-    # Start keyboard listener
-    with keyboard.Listener(on_press=on_press) as listener:
-        listener.join()
+
+    try:
+        if PUBLIC_HISTORY_DECODER_ENABLED:
+            public_history_runtime = (
+                create_continuous_public_history_runtime(monitor_num)
+            )
+            live_capture_service = public_history_runtime.capture_service
+            public_history_runtime.start()
+            console.print(
+                "[yellow]Experimental continuous public history: ON "
+                f"({LIVE_CAPTURE_FPS:g} fps, one bounded Gemini request per "
+                "stable keyframe). Villain CHECK/action-on is accepted only "
+                "when visibly proved; ambiguous hands are gapped and no "
+                "strategy fallback is used.[/yellow]"
+            )
+        elif LIVE_CAPTURE_ENABLED:
+            live_capture_service = create_live_capture_service(monitor_num)
+            live_capture_service.start()
+            console.print(
+                "[dim]Continuous capture observer: ON "
+                f"({LIVE_CAPTURE_FPS:g} fps, "
+                f"{LIVE_CAPTURE_MAX_PENDING} pending keyframes max). "
+                "No OCR or model calls are made by this observer.[/dim]"
+            )
+
+        # Start keyboard listener
+        with keyboard.Listener(on_press=on_press) as listener:
+            listener.join()
+    finally:
+        if public_history_runtime is not None:
+            public_history_runtime.stop()
+            pending = public_history_runtime.capture_service.ring.pending()
+            gaps = public_history_runtime.capture_service.ring.gaps()
+            worker_view = public_history_runtime.worker.view()
+            console.print(
+                "[dim]Continuous public history stopped: "
+                f"{len(pending)} pending keyframes, "
+                f"{len(gaps)} explicit gap(s), "
+                f"{worker_view.events} decoded event(s).[/dim]"
+            )
+        elif live_capture_service is not None:
+            live_capture_service.stop()
+            pending = live_capture_service.ring.pending()
+            gaps = live_capture_service.ring.gaps()
+            console.print(
+                "[dim]Continuous capture stopped: "
+                f"{len(pending)} pending keyframes, "
+                f"{len(gaps)} explicit gap(s).[/dim]"
+            )
     
     console.print("\n[green]Good luck at the tables! 🍀[/green]")
 

@@ -18,24 +18,32 @@ approximate; Claude and hybrid fallback remain explicit opt-ins.
    occupied opponent without cards is folded, regardless of a conflicting VLM
    status flag. Hero's username is pinned by `HERO_USERNAME`.
 5. Calculates hand rank, pot odds, effective stack, and SPR locally.
-6. In the default GTO backend, routes supported exact-profile decisions to the
-   validated preflop blueprint. It rejects explicitly approximate outcomes and
-   never falls back to Claude. Current six-max-origin postflop solves are marked
-   approximate because folded-card bunching is not yet supplied to the HU
-   engine, so strict GTO fails closed on them.
+6. In the default GTO backend, routes decisions that exactly match the fixed
+   blueprint profile to the validated preflop source. It rejects explicitly
+   approximate outcomes and never falls back to Claude. Current six-max-origin
+   postflop solves are marked approximate because folded-card bunching is not
+   yet supplied to the HU engine, so strict GTO fails closed on them.
 7. With the explicit `CLAUDE` or `HYBRID` backend, FAST uses Haiku and COACH
    uses Sonnet after Gemini has reconstructed the table. Claude receives compact
    verified state rather than performing a second OCR pass over the cards.
 8. Recaptures the table after Vision and again after strategy analysis; if it changed, the
    obsolete recommendation is discarded instead of displayed.
 
-Each validated analysis adds a snapshot to the current hand. A confirmed new
-hand resets the accumulated history automatically; `n` remains available for a
-manual reset. In parallel, a fail-closed public-event recorder reconstructs
-fold/check/call/bet-to/raise-to/all-in and board-deal events. It exposes a
-server transcript only while the observations form one gap-free legal path;
-the session JSONL archives the raw snapshot, canonical prefix, and any recorder
-error locally.
+Each validated manual analysis adds a snapshot to the current hand. A confirmed
+new hand resets the accumulated history automatically; `n` remains available
+for a manual reset. A fail-closed public-event recorder reconstructs
+fold/check/call/bet-to/raise-to/all-in and board-deal events from those accepted
+snapshots and exposes a server transcript only while they form one gap-free
+legal path. Hero-turn-only captures normally cannot observe every transition.
+The experimental, default-off `PUBLIC_HISTORY_DECODER_ENABLED=1` path is now
+wired: it runs the sampler, makes at most one bounded Gemini request for each
+stable keyframe, and transactionally publishes one matching
+snapshot/transcript pair only while every transition remains proved.
+Transition keyframes spend no model call; capture, queue, timeout, validation,
+or ambiguous-boundary failures gap the hand. An opponent check that produces
+no visible evidence still cannot be invented, so the transcript remains
+unavailable in that case. The session JSONL archives the manual raw snapshot,
+canonical prefix, and any recorder error locally.
 
 ## Setup
 
@@ -78,6 +86,12 @@ Add your API keys to `.env`, then calibrate the screen regions if necessary:
   `10000`, `6.5`, and `12.0`. Gemini enforces a 10-second minimum deadline;
   this is only a failure ceiling and does not delay successful responses.
   `CLAUDE_COACH_TIMEOUT_SECONDS` defaults to `15.0`.
+- `LIVE_CAPTURE_ENABLED=1` enables the local-CV observer only and makes no
+  provider calls. `PUBLIC_HISTORY_DECODER_ENABLED=1` is a separate experimental
+  opt-in that starts continuous capture and semantic Gemini decoding even when
+  the observer flag is off. `PUBLIC_HISTORY_DECODE_TIMEOUT_SECONDS` defaults to
+  `8`; multiway-v3 refuses advice whenever this runtime is unhealthy or its
+  latest atomic snapshot/transcript pair is no longer current.
 - `CLAUDE_MODEL` is used by COACH mode and defaults to `claude-sonnet-5`.
 
 ```bash
@@ -94,7 +108,8 @@ You can pass a monitor number to the assistant, for example
 - `l`: capture and inspect the reconstructed state only
 - `n`: start a new hand and reset history
 - `p`: show the preflop chart
-- `m`: switch between FAST (Haiku) and COACH (Sonnet) mode
+- `m`: switch between FAST (Haiku) and COACH (Sonnet) only when the configured
+  backend is `CLAUDE` or `HYBRID`; solver-only backends hide and disable it
 - `q` or `Esc`: quit
 
 Analysis runs in a background worker. Repeated `j`/`l` presses while one request
@@ -205,11 +220,11 @@ Unsupported nodes, cache misses, bounded-solve failures, and approximate
 profiles therefore fail closed. `CLAUDE` and `HYBRID` are explicit opt-ins;
 `HYBRID` tries the solver first and uses the selected Claude mode only after a
 solver failure. `GTO_HU` is a separate solver-only trial mode: it never calls
-Claude, automatically routes preflop to the blueprint and eligible postflop
-heads-up nodes to the Rust solver, and displays bounded six-max-to-HU results
-only under the `APPROXIMATE_SOLVER` label. The solver path requires both a
-feature flag and confirmation that the target environment is controlled by the
-user:
+Claude, routes preflop when the configured blueprint supplies a policy, routes
+eligible postflop heads-up nodes to the Rust solver, and displays bounded
+six-max-to-HU results only under the `APPROXIMATE_SOLVER` label. The solver
+path requires both a feature flag and confirmation that the target environment
+is controlled by the user:
 
 ```dotenv
 STRATEGY_BACKEND=GTO
@@ -298,13 +313,21 @@ and missing cache entries are labelled unsupported. `HYBRID` then falls back to
 Claude and prints the reason; `GTO` and `GTO_HU` both fail closed without
 calling Claude.
 
+With `GTO_HU` plus `GTO_RANGE_SOURCE=charts`, a same-hand preflop capture may
+provide position continuity when OCR stack deltas cannot prove the terminal
+preflop wager. This does not invent a terminal betting path: the static
+Hero/villain position ranges and the missing wager handoff are printed in the
+approximation boundary. Strict `GTO` and blueprint routing do not use this
+fallback.
+
 The full-hand recorder has a stricter requirement than the current
 Hero-decision workflow: it needs the untouched preflop frame and every public
 action transition, including opponent checks. Pressing `j` only on Hero turns
-cannot guarantee that coverage. Until a continuous owned-simulator event feed
-or sufficiently frequent validated observations supply every transition, the
-`public_hand` field remains absent and any declared full backend refuses the
-solve instead of guessing the skipped path.
+cannot guarantee that coverage. The experimental continuous decoder can supply
+the path when stable observations visibly prove every transition, but it
+deliberately gaps on invisible checks, ambiguous boundaries, dropped frames,
+or provider/runtime failures. Otherwise `public_hand` remains absent and any
+declared full backend refuses the solve instead of guessing the skipped path.
 
 This is not a complete real-time solution of six-max Hold'em. The native solver
 is still HU-only and folded-card bunching from the four folded preflop ranges is
@@ -322,15 +345,16 @@ and remaining architecture are tracked in
 
 ### Remote solve server
 
-The OCR and table-state pipeline can now remain on the Mac while the
-CPU/RAM-heavy router runs on rented Linux hardware. The local application
-validates the capture and sends only a canonical `LiveDecisionState` plus the
-gap-free public-hand transcript, when available, over an authenticated HTTPS
-request. The server independently replays the transcript and owns the preflop
-blueprint, persistent SQLite solver cache, range reconstruction, and solver.
-Its response is bound to both a unique request ID and a SHA-256 fingerprint of
-the captured decision; the Mac still revalidates the returned action and
-recaptures the screen before displaying it.
+The OCR and table-state pipeline can remain on the Mac while the CPU/RAM-heavy
+router runs on rented Linux hardware. HU schema v2 sends a canonical
+`LiveDecisionState` and may include a gap-free public-hand transcript. Multiway
+schema v3 instead requires a transcript-first `MultiwayDecisionState`
+containing exactly the complete public hand, Hero seat/cards, and capture ID;
+pot, board, stacks, actor, and legal actions are independently derived by
+replay. The server owns the preflop blueprint, persistent SQLite solver cache,
+range reconstruction, and solver. Its response is bound to both a unique
+request ID and a SHA-256 fingerprint of the captured decision; the Mac still
+revalidates the returned action and recaptures the screen before displaying it.
 
 Select the transport explicitly:
 
@@ -354,6 +378,12 @@ a no-shell, timeout- and size-bounded stdin/stdout adapter for an owned or
 licensed solver; it does not bundle or claim an undocumented commercial API.
 `/v1/about` exposes a validated capability manifest and the exact gaps
 preventing a full-six-max claim.
+
+The v3 contract, external adapter boundary, and experimental automatic
+keyframe-to-event decoder are connected. The decoder is default-off and must
+hold a current gap-free atomic snapshot/transcript token for every multiway-v3
+request and again before display. No licensed multiway solver adapter is
+included, so `GTO_MULTIWAY` is still not available end to end.
 
 Server-only validation can be run with no Vision or language-model calls:
 
@@ -388,12 +418,13 @@ six-max validation process, representative corpus design, independent
 cross-check, and compute-cost controls are in
 [docs/gto_server_validation.md](docs/gto_server_validation.md).
 
-Fresh street solves use separate deadlines. Strict GTO now defaults to solving
-an unseen flop (`GTO_FLOP_CACHE_ONLY=0`) with a 180-second ceiling and a 0.1%
-pot exploitability target. This favors solver quality over live latency; warm
-the cache offline or move solving to a higher-core, larger-memory CPU machine
-before expecting wide flop trees to finish during a decision. All settings are
-listed in `.env.example`.
+Fresh street solves use separate deadlines. The native HU router is configured
+to attempt an unseen flop (`GTO_FLOP_CACHE_ONLY=0`) with a 180-second ceiling
+and a 0.1% pot exploitability target. Strict `GTO` still refuses the result
+when the six-max-origin profile is marked approximate. Warm the cache offline
+or move solving to a higher-core, larger-memory CPU machine before expecting
+wide flop trees to finish during a decision. All settings are listed in
+`.env.example`.
 
 On the current Apple Silicon development machine, an end-to-end router check
 of a full-range synthetic turn node took about `0.19s` fresh and `0.03s` from

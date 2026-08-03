@@ -308,6 +308,28 @@ class PublicHandWireTests(unittest.TestCase):
             (replace(state, street="RIVER"), "board must contain"),
             (replace(state, hero_position="BTN"), "action on Hero"),
             (replace(state, active_villains=2), "active players"),
+            (replace(state, pot_bb=Decimal("999")), "pot differs"),
+            (replace(state, hero_stack_bb=Decimal("1")), "Hero stack differs"),
+            (
+                replace(state, hero_current_bet_bb=Decimal("50")),
+                "Hero current bet differs",
+            ),
+            (
+                replace(state, villain_position="CO"),
+                "Villain position differs",
+            ),
+            (
+                replace(state, villain_stack_bb=Decimal("1")),
+                "Villain stack differs",
+            ),
+            (
+                replace(state, villain_current_bet_bb=Decimal("50")),
+                "Villain current bet differs",
+            ),
+            (
+                replace(state, hero_is_oop=False),
+                "relative position differs",
+            ),
             (replace(state, amount_to_call_bb=Decimal("1")), "call amount"),
             (
                 replace(state, legal_actions=("FOLD", "CALL")),

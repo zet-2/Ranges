@@ -34,12 +34,29 @@ from .external_backend import (
     ExternalBackendConfigurationError,
     ExternalSolverBackend,
 )
+from .multiway_outcome import (
+    MultiwaySolveOutcome,
+    encode_json as encode_multiway_json,
+    outcome_to_wire as multiway_outcome_to_wire,
+)
+from .multiway_protocol import (
+    MultiwayDecisionState,
+    MultiwayProtocolError,
+    PROTOCOL_SCHEMA_VERSION as MULTIWAY_PROTOCOL_SCHEMA_VERSION,
+    parse_evaluate_request as parse_multiway_evaluate_request,
+)
 from .protocol import (
     PROTOCOL_SCHEMA_VERSION,
     RemoteProtocolError,
     encode_json,
     outcome_to_wire,
     parse_evaluate_request,
+)
+
+
+SUPPORTED_PROTOCOL_SCHEMA_VERSIONS = (
+    PROTOCOL_SCHEMA_VERSION,
+    MULTIWAY_PROTOCOL_SCHEMA_VERSION,
 )
 
 
@@ -65,6 +82,10 @@ class RequestInProgressError(BusyError):
 
 class IdempotencyConflictError(RuntimeError):
     """A request ID was reused for a different captured state."""
+
+
+class UnsupportedSchemaError(RuntimeError):
+    """The configured router does not implement the requested protocol."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,6 +225,27 @@ class EvaluationService:
             raise ValueError("cache_entries must be 1..100000")
         self.router = router
         self.capabilities = capabilities_for_router(router)
+        declared_versions = getattr(
+            router,
+            "supported_schema_versions",
+            (PROTOCOL_SCHEMA_VERSION,),
+        )
+        if (
+            not isinstance(declared_versions, (tuple, list))
+            or not declared_versions
+            or any(
+                isinstance(version, bool)
+                or not isinstance(version, int)
+                or version not in SUPPORTED_PROTOCOL_SCHEMA_VERSIONS
+                for version in declared_versions
+            )
+        ):
+            raise ValueError(
+                "router.supported_schema_versions is invalid"
+            )
+        self.supported_schema_versions = tuple(
+            dict.fromkeys(declared_versions)
+        )
         self.cache_entries = cache_entries
         self._solver_slot = threading.Lock()
         self._state_lock = threading.Lock()
@@ -221,6 +263,16 @@ class EvaluationService:
         state,
     ) -> tuple[bytes, bool]:
         """Return ``(response_body, cache_hit)`` or fail without queueing."""
+
+        requested_schema = (
+            MULTIWAY_PROTOCOL_SCHEMA_VERSION
+            if isinstance(state, MultiwayDecisionState)
+            else PROTOCOL_SCHEMA_VERSION
+        )
+        if requested_schema not in self.supported_schema_versions:
+            raise UnsupportedSchemaError(
+                f"configured backend does not support schema {requested_schema}"
+            )
 
         with self._state_lock:
             cached = self._cache.get(request_id)
@@ -256,7 +308,22 @@ class EvaluationService:
                 self._in_flight[request_id] = fingerprint
 
             outcome = self.router.evaluate(state)
-            body = encode_json(outcome_to_wire(request_id, fingerprint, outcome))
+            if isinstance(state, MultiwayDecisionState):
+                if not isinstance(outcome, MultiwaySolveOutcome):
+                    raise TypeError(
+                        "multiway router must return MultiwaySolveOutcome"
+                    )
+                body = encode_multiway_json(
+                    multiway_outcome_to_wire(
+                        request_id,
+                        fingerprint,
+                        outcome,
+                    )
+                )
+            else:
+                body = encode_json(
+                    outcome_to_wire(request_id, fingerprint, outcome)
+                )
             with self._state_lock:
                 self._cache[request_id] = _CachedResponse(fingerprint, body)
                 self._cache.move_to_end(request_id)
@@ -319,6 +386,9 @@ class GTORequestHandler(BaseHTTPRequestHandler):
                 {
                     "status": "ok",
                     "schema_version": PROTOCOL_SCHEMA_VERSION,
+                    "supported_schema_versions": list(
+                        self.api_server.service.supported_schema_versions
+                    ),
                 },
             )
             return
@@ -357,6 +427,9 @@ class GTORequestHandler(BaseHTTPRequestHandler):
                 HTTPStatus.OK,
                 {
                     "schema_version": PROTOCOL_SCHEMA_VERSION,
+                    "supported_schema_versions": list(
+                        self.api_server.service.supported_schema_versions
+                    ),
                     "license": "AGPL-3.0-or-later",
                     "source_url": self.api_server.api_config.source_url,
                     "max_concurrent_evaluations": 1,
@@ -454,8 +527,18 @@ class GTORequestHandler(BaseHTTPRequestHandler):
             )
             return
         try:
-            request_id, state, fingerprint = parse_evaluate_request(body)
-        except RemoteProtocolError as error:
+            try:
+                request_id, state, fingerprint = parse_evaluate_request(body)
+            except RemoteProtocolError as v2_error:
+                if (
+                    f"unsupported schema_version "
+                    f"{MULTIWAY_PROTOCOL_SCHEMA_VERSION}" not in str(v2_error)
+                ):
+                    raise
+                request_id, state, fingerprint = (
+                    parse_multiway_evaluate_request(body)
+                )
+        except (RemoteProtocolError, MultiwayProtocolError) as error:
             self._api_error(
                 HTTPStatus.BAD_REQUEST,
                 "INVALID_REQUEST",
@@ -528,6 +611,14 @@ class GTORequestHandler(BaseHTTPRequestHandler):
                     "Retry-After": "1",
                     "X-Request-ID": request_id,
                 },
+            )
+            return
+        except UnsupportedSchemaError as error:
+            self._api_error(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                "UNSUPPORTED_SCHEMA",
+                str(error),
+                extra_headers={"X-Request-ID": request_id},
             )
             return
         except Exception:

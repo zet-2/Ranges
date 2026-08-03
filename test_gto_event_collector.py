@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from dataclasses import replace
 from decimal import Decimal
+import threading
 from types import SimpleNamespace
 import unittest
 
 from gto_event_collector import (
+    PublicEventCollectionError,
     PublicEventCollectorConfig,
+    PublicEventProbeStatus,
     PublicHandEventRecorder,
 )
 from gto_hand_history import PublicHandHistory, replay_public_hand
@@ -191,6 +194,154 @@ class PublicEventRecorderTests(unittest.TestCase):
         )
         self.assertIsNotNone(recorder.observe(snapshot_for_prefix(target, 0)))
         self.assertEqual(target.seats, recorder.history.seats)
+
+    def test_rejected_probe_does_not_poison_or_mutate_recorder(self):
+        target = heads_up_to_turn_history()
+        recorder = PublicHandEventRecorder()
+        recorder.observe(snapshot_for_prefix(target, 0))
+        initial_history = recorder.history
+        initial_version = recorder.version
+
+        rejected = recorder.probe(snapshot_for_prefix(target, 2))
+
+        self.assertEqual(PublicEventProbeStatus.REJECTED, rejected.status)
+        self.assertFalse(rejected.accepted)
+        self.assertIn("skipped", rejected.error)
+        self.assertEqual(initial_history, recorder.history)
+        self.assertEqual(initial_version, recorder.version)
+        self.assertEqual("", recorder.error)
+        self.assertTrue(recorder.complete)
+
+        accepted = recorder.probe(snapshot_for_prefix(target, 1))
+        recorder.commit(accepted)
+        self.assertEqual(target.events[:1], recorder.history.events)
+        self.assertEqual("", recorder.error)
+
+    def test_probe_commit_rejects_stale_or_rejected_transaction(self):
+        target = heads_up_to_turn_history()
+        recorder = PublicHandEventRecorder()
+        first = recorder.probe(snapshot_for_prefix(target, 0))
+        stale = recorder.probe(snapshot_for_prefix(target, 0))
+        recorder.commit(first)
+
+        with self.assertRaisesRegex(
+            PublicEventCollectionError,
+            "stale observation probe",
+        ):
+            recorder.commit(stale)
+
+        rejected = recorder.probe(snapshot_for_prefix(target, 2))
+        with self.assertRaisesRegex(
+            PublicEventCollectionError,
+            "cannot commit rejected",
+        ):
+            recorder.commit(rejected)
+
+        foreign = PublicHandEventRecorder().probe(
+            snapshot_for_prefix(target, 0)
+        )
+        with self.assertRaisesRegex(
+            PublicEventCollectionError,
+            "another recorder",
+        ):
+            recorder.commit(foreign)
+
+    def test_concurrent_commits_allow_exactly_one_probe(self):
+        target = heads_up_to_turn_history()
+        recorder = PublicHandEventRecorder()
+        probes = (
+            recorder.probe(snapshot_for_prefix(target, 0)),
+            recorder.probe(snapshot_for_prefix(target, 0)),
+        )
+        barrier = threading.Barrier(3)
+        outcomes = []
+        outcomes_lock = threading.Lock()
+
+        def commit(probe):
+            barrier.wait()
+            try:
+                recorder.commit(probe)
+                result = "accepted"
+            except PublicEventCollectionError as error:
+                result = str(error)
+            with outcomes_lock:
+                outcomes.append(result)
+
+        threads = [
+            threading.Thread(target=commit, args=(probe,))
+            for probe in probes
+        ]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join(timeout=2)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(1, outcomes.count("accepted"))
+        self.assertEqual(1, sum("stale" in outcome for outcome in outcomes))
+
+    def test_probe_reports_duplicate_advance_and_new_hand_anchor(self):
+        target = heads_up_to_turn_history()
+        recorder = PublicHandEventRecorder()
+
+        anchor = recorder.probe(snapshot_for_prefix(target, 0))
+        self.assertEqual(PublicEventProbeStatus.ANCHORED, anchor.status)
+        self.assertEqual(0, anchor.events_added)
+        recorder.commit(anchor)
+
+        duplicate = recorder.probe(snapshot_for_prefix(target, 0))
+        self.assertEqual(PublicEventProbeStatus.DUPLICATE, duplicate.status)
+        self.assertEqual(0, duplicate.events_added)
+        recorder.commit(duplicate)
+
+        advance = recorder.probe(snapshot_for_prefix(target, 1))
+        self.assertEqual(PublicEventProbeStatus.ADVANCED, advance.status)
+        self.assertEqual(1, advance.events_added)
+        recorder.commit(advance)
+
+        next_hand = replace(target, hand_id="next-hand")
+        replacement = recorder.probe(snapshot_for_prefix(next_hand, 0))
+        self.assertEqual(
+            PublicEventProbeStatus.NEW_HAND_ANCHORED,
+            replacement.status,
+        )
+        self.assertTrue(replacement.replaces_hand)
+        recorder.commit(replacement)
+        self.assertEqual("next-hand", recorder.history.hand_id)
+        self.assertEqual((), recorder.history.events)
+
+    def test_explicit_gap_invalidates_until_reset_or_new_hand(self):
+        target = heads_up_to_turn_history()
+        recorder = PublicHandEventRecorder()
+        recorder.observe(snapshot_for_prefix(target, 0))
+        retained_history = recorder.history
+
+        recorder.invalidate_gap("keyframe queue overflow")
+
+        self.assertFalse(recorder.complete)
+        self.assertEqual(retained_history, recorder.history)
+        self.assertIn("capture gap", recorder.error)
+        rejected = recorder.probe(snapshot_for_prefix(target, 1))
+        self.assertEqual(PublicEventProbeStatus.REJECTED, rejected.status)
+        self.assertIn("capture gap", rejected.error)
+
+        next_hand = replace(target, hand_id="recovered")
+        recovery = recorder.probe(snapshot_for_prefix(next_hand, 0))
+        self.assertEqual(
+            PublicEventProbeStatus.NEW_HAND_ANCHORED,
+            recovery.status,
+        )
+        recorder.commit(recovery)
+        self.assertTrue(recorder.complete)
+        self.assertEqual("recovered", recorder.history.hand_id)
+
+    def test_invalidate_gap_requires_reason(self):
+        with self.assertRaisesRegex(
+            PublicEventCollectionError,
+            "reason cannot be empty",
+        ):
+            PublicHandEventRecorder().invalidate_gap("")
 
 
 if __name__ == "__main__":

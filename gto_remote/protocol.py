@@ -423,6 +423,60 @@ def _validate_public_hand_binding(state: LiveDecisionState) -> None:
         raise RemoteProtocolError(
             "state.public_hand active players differ from active_villains"
         )
+    if replayed.pot_bb != state.pot_bb:
+        raise RemoteProtocolError(
+            "state.public_hand pot differs from the captured decision"
+        )
+    if replayed.stack_map[hero_seat] != state.hero_stack_bb:
+        raise RemoteProtocolError(
+            "state.public_hand Hero stack differs from the captured decision"
+        )
+    if (
+        replayed.street_contribution_map[hero_seat]
+        != state.hero_current_bet_bb
+    ):
+        raise RemoteProtocolError(
+            "state.public_hand Hero current bet differs from the captured "
+            "decision"
+        )
+    live_villain_seats = tuple(sorted(replayed.live_seats - {hero_seat}))
+    if len(live_villain_seats) == 1:
+        villain_seat = live_villain_seats[0]
+        villain = next(
+            seat for seat in public_hand.seats if seat.seat == villain_seat
+        )
+        if villain.position != state.villain_position:
+            raise RemoteProtocolError(
+                "state.public_hand Villain position differs from the "
+                "captured decision"
+            )
+        if replayed.stack_map[villain_seat] != state.villain_stack_bb:
+            raise RemoteProtocolError(
+                "state.public_hand Villain stack differs from the "
+                "captured decision"
+            )
+        if (
+            replayed.street_contribution_map[villain_seat]
+            != state.villain_current_bet_bb
+        ):
+            raise RemoteProtocolError(
+                "state.public_hand Villain current bet differs from the "
+                "captured decision"
+            )
+        if replayed.street != "PREFLOP":
+            ordered = sorted(seat.seat for seat in public_hand.seats)
+            button_index = ordered.index(public_hand.button_seat)
+            postflop_order = (
+                ordered[button_index + 1 :] + ordered[: button_index + 1]
+            )
+            first_live_seat = next(
+                seat for seat in postflop_order if seat in replayed.live_seats
+            )
+            if (hero_seat == first_live_seat) != state.hero_is_oop:
+                raise RemoteProtocolError(
+                    "state.public_hand Hero relative position differs from "
+                    "the captured decision"
+                )
     if replayed.amount_to_call_bb != state.amount_to_call_bb:
         raise RemoteProtocolError(
             "state.public_hand call amount differs from the captured decision"

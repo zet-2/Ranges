@@ -1558,6 +1558,106 @@ class FreshnessAndButtonTests(unittest.TestCase):
         )
 
 
+class PresentationUXTests(unittest.TestCase):
+    @staticmethod
+    def multiway_river():
+        return snapshot(
+            [
+                player(0, "CO", status="FOLDED"),
+                player(1, "BTN"),
+                player(2, "SB"),
+                player(3, "BB"),
+                player(4, "UTG", hero=True),
+                player(5, "MP", status="FOLDED"),
+            ],
+            street="RIVER",
+            board=["5h", "Jd", "8s", "7d", "6s"],
+            pot=27.1,
+        )
+
+    def test_multiway_solver_limit_is_a_clear_wait_state(self):
+        recommendation, details, style = app.strategy_display_content(
+            self.multiway_river(),
+            (
+                "Strategy Error: GTO_HU unsupported: the live state does not "
+                "identify exactly one HU villain"
+            ),
+        )
+
+        self.assertEqual("WAIT FOR HEADS-UP (3 LEFT)", recommendation)
+        self.assertIn("exactly 1 opponent", details)
+        self.assertIn("Press J again when only 1 opponent remains", details)
+        self.assertNotIn("live state", details)
+        self.assertEqual("bold black on cyan", style)
+
+    def test_preflop_solver_limit_explains_current_coverage(self):
+        state = self.multiway_river()
+        state.meta_info.current_street = "PREFLOP"
+        state.board_state.community_cards = []
+
+        recommendation, details, style = app.strategy_display_content(
+            state,
+            (
+                "Strategy Error: GTO_HU unsupported: the configured range "
+                "source has no preflop mixed policy"
+            ),
+        )
+
+        self.assertEqual("POSTFLOP GTO ONLY", recommendation)
+        self.assertIn("Use P for the preflop chart", details)
+        self.assertEqual("bold black on cyan", style)
+
+    def test_successful_solver_action_keeps_action_first(self):
+        recommendation, details, style = app.strategy_display_content(
+            self.multiway_river(),
+            (
+                "**Action:** Bet\n"
+                "**Size:** 13.5 BB\n"
+                "**Why:** Solver-selected action.\n"
+                "* **GTO mix:** Bet 70% | Check 30%"
+            ),
+        )
+
+        self.assertEqual("Bet 13.5 BB", recommendation)
+        self.assertIn("GTO mix", details)
+        self.assertEqual("bold white on green", style)
+
+    def test_failure_reason_is_hidden_from_timing_header(self):
+        self.assertEqual(
+            "",
+            app.visible_strategy_source(
+                "GTO_HU unsupported: the live state does not identify exactly "
+                "one HU villain"
+            ),
+        )
+        self.assertEqual(
+            "APPROXIMATE_SOLVER fresh",
+            app.visible_strategy_source("APPROXIMATE_SOLVER fresh"),
+        )
+
+    def test_stale_button_reason_is_user_facing(self):
+        self.assertEqual(
+            "available action or amount changed",
+            app.friendly_stale_reasons(["Hero action controls changed"]),
+        )
+
+    def test_incomplete_multiway_history_is_explained_without_solver_jargon(self):
+        recommendation, details, style = app.strategy_display_content(
+            self.multiway_river(),
+            (
+                "Strategy Error: GTO unavailable: complete multiway "
+                "public_hand is unavailable: continuous history has not "
+                "reached this decision"
+            ),
+        )
+
+        self.assertEqual("FULL HISTORY NOT READY", recommendation)
+        self.assertIn("every action", details)
+        self.assertIn("no action was calculated", details)
+        self.assertNotIn("public_hand", details)
+        self.assertEqual("bold black on yellow", style)
+
+
 class StrategyBackendIntegrationTests(unittest.TestCase):
     @staticmethod
     def heads_up_state(*, pot=4.0, hero_stack=100.0, villain_stack=80.0):
@@ -1577,6 +1677,71 @@ class StrategyBackendIntegrationTests(unittest.TestCase):
     def test_default_backend_is_strict_gto(self):
         self.assertEqual("GTO", app.DEFAULT_STRATEGY_BACKEND)
         self.assertIn("GTO_HU", app.VALID_STRATEGY_BACKENDS)
+        self.assertIn("GTO_MULTIWAY", app.VALID_STRATEGY_BACKENDS)
+
+    def test_multiway_v3_builder_uses_only_the_replayable_transcript(self):
+        from test_gto_multiway_protocol import four_way_flop_history
+
+        public_hand = four_way_flop_history()
+        replayed = public_hand.replay()
+        players = []
+        seat_by_id = {seat.seat: seat for seat in public_hand.seats}
+        for seat in sorted(seat_by_id):
+            players.append(
+                app.Player(
+                    seat_index=seat,
+                    name=seat_by_id[seat].position,
+                    username="Hero" if seat == 4 else f"Villain{seat}",
+                    stack_size=float(replayed.stack_map[seat]),
+                    current_bet=float(
+                        replayed.street_contribution_map[seat]
+                    ),
+                    status=(
+                        "FOLDED"
+                        if seat in replayed.folded
+                        else "ALL_IN"
+                        if seat in replayed.all_in
+                        else "ACTIVE"
+                    ),
+                    is_hero=seat == 4,
+                    hole_cards=["Qc", "Qd"] if seat == 4 else None,
+                    is_dealer=seat == public_hand.button_seat,
+                )
+            )
+        state = app.GameSnapshot(
+            hand_id=public_hand.hand_id,
+            timestamp="2026-07-30T12:00:00Z",
+            meta_info=app.MetaInfo(current_street=replayed.street),
+            board_state=app.BoardState(
+                community_cards=list(replayed.board),
+                total_pot=float(replayed.pot_bb),
+            ),
+            dealer_seat_index=public_hand.button_seat,
+            action_on_seat_index=4,
+            players=players,
+            last_action_context=app.LastActionContext(
+                amount_to_call=float(replayed.amount_to_call_bb),
+                hero_action_options=["Check", "Bet"],
+            ),
+        )
+        history = app.HandHistory(
+            hand_id=public_hand.hand_id,
+            snapshots=[state],
+        )
+        history.public_event_recorder.history = public_hand
+        prepared = app.prepare_strategy_state(state, history)
+
+        routed = app.build_multiway_solver_state(
+            state,
+            history,
+            prepared,
+        )
+
+        self.assertEqual(4, routed.hero_seat)
+        self.assertEqual(("Qc", "Qd"), routed.hero_combo)
+        self.assertEqual(frozenset({2, 3, 4, 5}), routed.replayed.live_seats)
+        self.assertEqual(Decimal("4"), routed.replayed.pot_bb)
+        self.assertFalse(hasattr(routed, "villain_position"))
 
     def test_solved_gto_bypasses_claude_and_preserves_source_and_metrics(self):
         state = self.heads_up_state()
@@ -1716,6 +1881,22 @@ class StrategyBackendIntegrationTests(unittest.TestCase):
             json.loads(result.prompt)["backend"],
         )
 
+    def test_multiway_mode_never_falls_back_to_the_local_hu_router(self):
+        state = self.heads_up_state()
+        history = app.HandHistory(snapshots=[state], hand_id=state.hand_id)
+        local_router = mock.Mock(spec=app.LiveGTORouter)
+
+        result = app.evaluate_strategy_backend(
+            state,
+            history,
+            backend="GTO_MULTIWAY",
+            router=local_router,
+        )
+
+        local_router.evaluate.assert_not_called()
+        self.assertEqual("GTO_MULTIWAY", result.mode)
+        self.assertIn("requires GTO_EXECUTION_MODE=remote", result.error)
+
     def test_gto_hu_unsupported_node_does_not_fall_back_to_claude(self):
         state = self.heads_up_state()
         history = app.HandHistory(snapshots=[state], hand_id=state.hand_id)
@@ -1742,6 +1923,101 @@ class StrategyBackendIntegrationTests(unittest.TestCase):
         evaluate_claude.assert_not_called()
         self.assertEqual("GTO_HU", result.mode)
         self.assertIn("GTO_HU unsupported", result.error)
+
+    def test_gto_hu_charts_use_same_hand_position_continuity(self):
+        hand_id = "live-position-continuity"
+        preflop = snapshot(
+            [
+                player(0, "MP", status="FOLDED", stack=250.4),
+                player(1, "CO", bet=2.0, stack=157.3),
+                player(2, "BTN", bet=2.0, stack=70.4),
+                player(3, "SB", status="FOLDED", bet=0.5, stack=250.6),
+                player(4, "BB", hero=True, stack=68.5),
+                player(5, "UTG", bet=1.0, stack=80.2),
+            ],
+            street="PREFLOP",
+            board=[],
+            dealer=2,
+            pot=6.5,
+        )
+        flop = snapshot(
+            [
+                player(0, "MP", status="FOLDED", stack=250.4),
+                player(1, "CO", stack=157.3),
+                player(2, "BTN", stack=70.4),
+                player(3, "SB", status="FOLDED", stack=250.6),
+                player(4, "BB", hero=True, stack=67.5),
+                player(5, "UTG", stack=80.2),
+            ],
+            street="FLOP",
+            board=["8s", "2s", "7h"],
+            dealer=2,
+            pot=8.03,
+        )
+        river = snapshot(
+            [
+                player(0, "MP", status="FOLDED", stack=0),
+                player(1, "CO", status="FOLDED", stack=153.3),
+                player(2, "BTN", stack=43.2),
+                player(3, "SB", status="FOLDED", stack=250.6),
+                player(4, "BB", hero=True, stack=40.3),
+                player(5, "UTG", status="FOLDED", stack=75.2),
+            ],
+            street="RIVER",
+            board=["8s", "2s", "7h", "Td", "4c"],
+            dealer=2,
+            pot=67.1,
+        )
+        for state in (preflop, flop, river):
+            state.hand_id = hand_id
+            state.action_on_seat_index = 4
+        history = app.HandHistory(
+            snapshots=[preflop, flop, river],
+            hand_id=hand_id,
+        )
+        outcome = SimpleNamespace(
+            solved=True,
+            status=app.LiveGTOStatus.SOLVED,
+            reason="",
+            analysis=(
+                "**Action:** Check\n"
+                "**Size:** 0\n"
+                "**Why:** Approximate chart-seeded solver mix."
+            ),
+            source="APPROXIMATE_SOLVER fresh",
+            approximate=True,
+            model="b-inary/postflop-solver",
+            spec=SimpleNamespace(cache_key="e" * 64),
+        )
+        router = mock.Mock()
+        router.config = SimpleNamespace(range_source="charts")
+        router.evaluate.return_value = outcome
+
+        with mock.patch.object(
+            app,
+            "evaluate_strategy_snapshot",
+            side_effect=AssertionError("GTO_HU must never invoke Claude"),
+        ):
+            result = app.evaluate_strategy_backend(
+                river,
+                history,
+                backend="GTO_HU",
+                router=router,
+            )
+
+        routed = router.evaluate.call_args.args[0]
+        self.assertEqual("", routed.preflop_mapping_error)
+        self.assertIsNotNone(routed.preflop_observation)
+        self.assertFalse(routed.preflop_observation.terminal)
+        self.assertEqual(
+            app.POSITION_ONLY_HANDOFF_SOURCE,
+            routed.preflop_observation.provenance.source,
+        )
+        self.assertEqual(
+            frozenset({"UTG", "CO", "BTN", "BB"}),
+            routed.preflop_observation.live_positions,
+        )
+        self.assertEqual("APPROXIMATE_SOLVER", result.mode)
 
     def test_strict_gto_rejects_approximate_result_without_calling_claude(self):
         state = self.heads_up_state()
@@ -2353,6 +2629,17 @@ class FlowFreshnessGateTests(unittest.TestCase):
 
 
 class AnalysisHotkeyLockTests(unittest.TestCase):
+    def test_claude_hotkey_is_disabled_in_gto_only_mode(self):
+        with (
+            mock.patch.object(app, "STRATEGY_BACKEND", "GTO_HU"),
+            mock.patch.object(app, "PROMPT_MODE", "FAST"),
+            mock.patch.object(app.console, "print") as output,
+        ):
+            app.on_press(SimpleNamespace(char="m"))
+            self.assertEqual("FAST", app.PROMPT_MODE)
+
+        self.assertIn("GTO-only mode", output.call_args.args[0])
+
     def test_repeated_analysis_request_is_ignored_while_worker_runs(self):
         started = threading.Event()
         release = threading.Event()
