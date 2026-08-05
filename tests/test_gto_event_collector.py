@@ -1,3 +1,5 @@
+"""Tests for fail-closed public hand-event collection."""
+
 from __future__ import annotations
 
 from dataclasses import replace
@@ -13,7 +15,7 @@ from gto_event_collector import (
     PublicHandEventRecorder,
 )
 from gto_hand_history import PublicHandHistory, replay_public_hand
-from test_gto_hand_history import heads_up_to_turn_history
+from tests.test_gto_hand_history import heads_up_to_turn_history
 
 
 def snapshot_for_prefix(

@@ -1,3 +1,5 @@
+"""Tests for the PokerStars MSS frame source."""
+
 from __future__ import annotations
 
 import threading

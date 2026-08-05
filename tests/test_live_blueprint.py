@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline integration tests for the live six-max preflop blueprint path.
+"""Offline automated tests for the live six-max preflop blueprint path.
 
 The fixture deliberately uses the production immutable blueprint models and a
 small but internally coherent six-max action tree.  It never reads the network

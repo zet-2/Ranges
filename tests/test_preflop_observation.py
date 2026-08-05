@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic tests for live preflop observation reconstruction."""
+"""Automated tests for live preflop observation reconstruction."""
 
 from __future__ import annotations
 

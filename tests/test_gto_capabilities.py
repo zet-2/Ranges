@@ -1,3 +1,5 @@
+"""Tests for audited GTO capability manifests."""
+
 from __future__ import annotations
 
 from dataclasses import replace
@@ -14,7 +16,7 @@ from gto_remote.capabilities import (
 )
 from gto_remote.server import EvaluationService
 from live_gto import LiveDecisionState
-from test_gto_hand_history import heads_up_to_turn_history
+from tests.test_gto_hand_history import heads_up_to_turn_history
 from gto_hand_history import HandEvent
 
 

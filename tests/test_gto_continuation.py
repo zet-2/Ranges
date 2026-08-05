@@ -1,3 +1,5 @@
+"""Tests for action-conditioned GTO continuation state."""
+
 from __future__ import annotations
 
 from decimal import Decimal
@@ -31,7 +33,7 @@ from live_gto_continuation import (
     build_live_continuation_spec,
     flop_range_state,
 )
-from test_gto_hand_history import heads_up_to_turn_history
+from tests.test_gto_hand_history import heads_up_to_turn_history
 
 
 _BINARY_DIGEST = "b" * 64

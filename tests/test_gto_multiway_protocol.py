@@ -1,3 +1,5 @@
+"""Tests for the transcript-first multiway-v3 protocol."""
+
 from __future__ import annotations
 
 from dataclasses import replace

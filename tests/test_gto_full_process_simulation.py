@@ -1,3 +1,5 @@
+"""Tests for the full GTO process simulation harness."""
+
 from __future__ import annotations
 
 from decimal import Decimal

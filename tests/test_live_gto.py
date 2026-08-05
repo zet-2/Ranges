@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Focused deterministic tests for the owned-simulator live GTO router."""
+"""Automated deterministic tests for the owned-simulator live GTO router."""
 
 from __future__ import annotations
 

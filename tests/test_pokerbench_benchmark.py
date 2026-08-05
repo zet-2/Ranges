@@ -1,3 +1,5 @@
+"""Tests for PokerBench benchmark loading, scoring, and reporting."""
+
 import csv
 import json
 import os

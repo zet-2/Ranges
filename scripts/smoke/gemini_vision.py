@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Test screenshot capture + Gemini Vision."""
+"""Manual screenshot capture and Gemini Vision smoke check."""
 
 import os
 import io

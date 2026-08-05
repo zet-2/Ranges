@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic regression tests for local poker facts and prompt inputs."""
+"""Automated regression tests for local poker facts and prompt inputs."""
 
 import json
 import os
@@ -1680,7 +1680,7 @@ class StrategyBackendIntegrationTests(unittest.TestCase):
         self.assertIn("GTO_MULTIWAY", app.VALID_STRATEGY_BACKENDS)
 
     def test_multiway_v3_builder_uses_only_the_replayable_transcript(self):
-        from test_gto_multiway_protocol import four_way_flop_history
+        from tests.test_gto_multiway_protocol import four_way_flop_history
 
         public_hand = four_way_flop_history()
         replayed = public_hand.replay()

@@ -19,15 +19,15 @@ six-player strategy is near equilibrium.
 Run the Python and Rust suites before renting a large machine:
 
 ```sh
-python3 -m unittest \
-  test_gto_hand_history \
-  test_gto_event_collector \
-  test_gto_capabilities \
-  test_gto_external_backend \
-  test_gto_remote \
-  test_gto_remote_client \
-  test_live_gto \
-  test_live_blueprint
+.venv/bin/python -m unittest \
+  tests.test_gto_hand_history \
+  tests.test_gto_event_collector \
+  tests.test_gto_capabilities \
+  tests.test_gto_external_backend \
+  tests.test_gto_remote \
+  tests.test_gto_remote_client \
+  tests.test_live_gto \
+  tests.test_live_blueprint
 
 cargo test --manifest-path gto_oracle_engine/Cargo.toml --locked
 ```

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Quick test to verify the Claude API is working for strategy."""
+"""Manual paid smoke check for the Claude strategy API."""
 
 import os
 

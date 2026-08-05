@@ -1,3 +1,5 @@
+"""Tests for canonical, replayable public hand histories."""
+
 from __future__ import annotations
 
 from dataclasses import replace

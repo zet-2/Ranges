@@ -1,3 +1,5 @@
+"""Tests for the authenticated remote GTO server."""
+
 from __future__ import annotations
 
 from decimal import Decimal
@@ -43,7 +45,7 @@ from gto_remote.server import (
 )
 from live_gto import LiveDecisionState, LiveGTOOutcome, LiveGTOStatus
 from preflop_observation import ObservationProvenance, ObservedPreflopState
-from test_gto_multiway_protocol import four_way_state
+from tests.test_gto_multiway_protocol import four_way_state
 
 
 POSITIONS = ("UTG", "HJ", "CO", "BTN", "SB", "BB")

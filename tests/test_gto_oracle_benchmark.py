@@ -1,3 +1,5 @@
+"""Tests for the GTO oracle benchmark and validation harness."""
+
 import json
 import itertools
 import tempfile

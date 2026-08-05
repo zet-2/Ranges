@@ -1,3 +1,5 @@
+"""Tests for bounded, ACK-aware live frame capture."""
+
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone

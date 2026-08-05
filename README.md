@@ -102,6 +102,24 @@ python poker_assistant.py
 You can pass a monitor number to the assistant, for example
 `python poker_assistant.py 2`.
 
+## Tests
+
+All automated Python tests live in `tests/` and are discovered as one package:
+
+```bash
+.venv/bin/python -m unittest discover -s tests -t .
+cargo test --manifest-path gto_oracle_engine/Cargo.toml --locked
+```
+
+The external Claude API and Gemini screenshot checks are manual smoke scripts,
+not unit tests. They can incur provider charges and the Vision check captures
+the screen, so run them explicitly only when needed:
+
+```bash
+.venv/bin/python scripts/smoke/claude_api.py
+.venv/bin/python scripts/smoke/gemini_vision.py
+```
+
 ## Controls
 
 - `j`: capture the table and request strategy advice

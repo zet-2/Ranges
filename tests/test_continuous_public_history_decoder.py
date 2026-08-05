@@ -1,3 +1,5 @@
+"""Tests for continuous public-history semantic decoding."""
+
 from __future__ import annotations
 
 from copy import deepcopy
@@ -34,8 +36,8 @@ from public_history_worker import (
     PublicHistoryWorker,
     WorkerEventDisposition,
 )
-from test_gto_event_collector import snapshot_for_prefix
-from test_gto_hand_history import heads_up_to_turn_history
+from tests.test_gto_event_collector import snapshot_for_prefix
+from tests.test_gto_hand_history import heads_up_to_turn_history
 
 
 POSITIONS = ("UTG", "HJ", "CO", "BTN", "SB", "BB")

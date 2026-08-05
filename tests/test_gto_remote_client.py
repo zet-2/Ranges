@@ -1,4 +1,4 @@
-"""Focused tests for the authenticated, bounded remote GTO transport."""
+"""Automated tests for the authenticated, bounded remote GTO transport."""
 
 from __future__ import annotations
 

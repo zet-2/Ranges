@@ -1,3 +1,5 @@
+"""Tests for transactional public-history publication."""
+
 from __future__ import annotations
 
 from dataclasses import replace
@@ -10,8 +12,8 @@ from public_history_pipeline import (
     PublicHistoryCoordinator,
     PublicHistoryStatus,
 )
-from test_gto_event_collector import snapshot_for_prefix
-from test_gto_hand_history import heads_up_to_turn_history
+from tests.test_gto_event_collector import snapshot_for_prefix
+from tests.test_gto_hand_history import heads_up_to_turn_history
 
 
 class PublicHistoryCoordinatorTests(unittest.TestCase):

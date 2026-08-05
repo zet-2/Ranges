@@ -1,3 +1,5 @@
+"""Tests for the authenticated multiway-v3 client."""
+
 from __future__ import annotations
 
 from decimal import Decimal
@@ -22,8 +24,8 @@ from gto_remote.multiway_protocol import (
     parse_evaluate_request,
 )
 from live_gto import LiveGTOStatus
-from test_gto_multiway_protocol import four_way_state
-from test_gto_remote_client import AUTH_TOKEN, FakeOpener, FakeResponse, REQUEST_ID
+from tests.test_gto_multiway_protocol import four_way_state
+from tests.test_gto_remote_client import AUTH_TOKEN, FakeOpener, FakeResponse, REQUEST_ID
 
 
 def capabilities() -> SolverCapabilities:
@@ -121,7 +123,7 @@ class RemoteMultiwayClientTests(unittest.TestCase):
 
     def test_rejects_non_multiway_state_before_network(self):
         opener = FakeOpener(response=FakeResponse(response_body()))
-        from test_gto_remote import sample_state
+        from tests.test_gto_remote import sample_state
 
         with self.assertRaises(RemoteGTORequestError):
             client(opener).request(sample_state(), request_id=REQUEST_ID)

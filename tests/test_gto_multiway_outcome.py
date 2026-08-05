@@ -1,3 +1,5 @@
+"""Tests for structured multiway solver outcomes."""
+
 from __future__ import annotations
 
 from dataclasses import replace
@@ -22,7 +24,7 @@ from gto_remote.multiway_protocol import (
     decision_fingerprint,
 )
 from live_gto import LiveGTOStatus
-from test_gto_multiway_protocol import four_way_state
+from tests.test_gto_multiway_protocol import four_way_state
 
 
 def capabilities() -> SolverCapabilities:

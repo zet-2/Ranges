@@ -1,3 +1,5 @@
+"""Tests for preflop action-history reconstruction."""
+
 from __future__ import annotations
 
 from decimal import Decimal

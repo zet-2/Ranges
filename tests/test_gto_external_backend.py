@@ -1,3 +1,5 @@
+"""Tests for the bounded external GTO backend boundary."""
+
 from __future__ import annotations
 
 from dataclasses import replace
@@ -27,8 +29,8 @@ from gto_remote.multiway_protocol import (
 )
 from gto_remote.server import EvaluationService
 from live_gto import LiveDecisionState, LiveGTOStatus
-from test_gto_hand_history import heads_up_to_turn_history
-from test_gto_multiway_protocol import four_way_state
+from tests.test_gto_hand_history import heads_up_to_turn_history
+from tests.test_gto_multiway_protocol import four_way_state
 
 
 SUCCESS_ADAPTER = r"""
