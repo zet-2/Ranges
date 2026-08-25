@@ -1,0 +1,49 @@
+{
+  "game": "hu_nlhe_jam_fold",
+  "private_model": {
+    "deals": [
+      {
+        "bb_type": "strong",
+        "sb_showdown_equity": "0.5",
+        "sb_type": "strong",
+        "weight": "1"
+      },
+      {
+        "bb_type": "weak",
+        "sb_showdown_equity": "0.8",
+        "sb_type": "strong",
+        "weight": "1"
+      },
+      {
+        "bb_type": "strong",
+        "sb_showdown_equity": "0.2",
+        "sb_type": "weak",
+        "weight": "1"
+      },
+      {
+        "bb_type": "weak",
+        "sb_showdown_equity": "0.5",
+        "sb_type": "weak",
+        "weight": "1"
+      }
+    ],
+    "model_id": "two_type_integration_reference",
+    "model_version": "v1",
+    "type_semantics": "explicit_finite_private_types"
+  },
+  "profile": {
+    "big_blind_bb": "1",
+    "effective_stack_bb": "2",
+    "profile_id": "hu_2bb_rake5_cap0.5_noflopnodrop",
+    "rake": {
+      "basis": "awarded_pot_after_uncalled_return",
+      "cap_bb": "0.5",
+      "chip_unit_bb": "0.01",
+      "no_flop_no_drop": true,
+      "rate_pct": "5",
+      "rounding": "floor_to_chip"
+    },
+    "small_blind_bb": "0.5"
+  },
+  "schema_version": 1
+}

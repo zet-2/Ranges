@@ -80,6 +80,11 @@ from preflop_observation import (
     current_decision as current_preflop_observation,
     terminal_from_history as terminal_preflop_observation,
 )
+from capture_layout import (
+    CANONICAL_SEAT_CAPTURES,
+    CaptureLayoutError,
+    load_capture_layout,
+)
 
 load_dotenv()
 console = Console()
@@ -121,6 +126,7 @@ VISION_LAYOUT = os.getenv("VISION_LAYOUT", "mosaic").lower()
 SAVE_DEBUG_IMAGES = os.getenv("SAVE_DEBUG_IMAGES", "0").lower() in {
     "1", "true", "yes", "on"
 }
+POKER_CAPTURE_LAYOUT_PATH = os.getenv("POKER_CAPTURE_LAYOUT_PATH", "").strip()
 LIVE_CAPTURE_ENABLED = os.getenv("LIVE_CAPTURE_ENABLED", "0").lower() in {
     "1", "true", "yes", "on"
 }
@@ -330,6 +336,8 @@ class GameSnapshot:
     players: list[Player] = dataclasses.field(default_factory=list)
     last_action_context: LastActionContext = dataclasses.field(default_factory=LastActionContext)
     vision_error: str = ""
+    capture_table_format: str = ""
+    capture_layout_fingerprint: str = ""
     
     def to_json(self):
         return json.dumps(dataclasses.asdict(self), indent=2)
@@ -818,9 +826,10 @@ def get_position_label_dynamic(seat_index: int, dealer_seat_index: int, active_s
 # ---------------------------------------------------------
 # REGION DEFINITIONS (Calibrated for User Screen)
 # ---------------------------------------------------------
-# Note: User must verify these coordinates via calibration tool if they drift.
-# (Placeholders used where previous calibration was lost)
-SEAT_ZONES = {
+# The embedded six-seat layout remains the unchanged compatibility default.
+# A native-HU profile is loaded only from a separately reviewed, fingerprinted
+# artifact; capture_layout.py rejects draft profiles and resolution drift.
+_LEGACY_SEAT_ZONES = {
     "seat1": {"left": 39.83203125, "top": 153.62890625, "width": 283.7890625, "height": 135.609375},
     "seat2": {"left": 373.20703125, "top": 90.53515625, "width": 234.67578125, "height": 146.4453125},
     "seat3": {"left": 608.52734375, "top": 126.84765625, "width": 309.59375, "height": 165.41796875},
@@ -832,20 +841,71 @@ SEAT_ZONES = {
     # Gemini could see in the dedicated BOARD crop.
     "board": {"top": 219, "left": 308, "width": 346, "height": 155}
 }
-BUTTONS_REGION = {"left": 472, "top": 579, "width": 483, "height": 141} # User provided
+_LEGACY_BUTTONS_REGION = {
+    "left": 472,
+    "top": 579,
+    "width": 483,
+    "height": 141,
+}
+
+CAPTURE_LAYOUT_PROFILE = None
+if POKER_CAPTURE_LAYOUT_PATH:
+    try:
+        CAPTURE_LAYOUT_PROFILE = load_capture_layout(POKER_CAPTURE_LAYOUT_PATH)
+    except CaptureLayoutError as error:
+        raise RuntimeError(f"invalid POKER_CAPTURE_LAYOUT_PATH: {error}") from error
+    if (
+        CAPTURE_LAYOUT_PROFILE.table_format == "heads_up"
+        and VISION_LAYOUT != "mosaic"
+    ):
+        raise RuntimeError(
+            "native-HU capture profiles require VISION_LAYOUT=mosaic"
+        )
+
+if CAPTURE_LAYOUT_PROFILE is None:
+    SEAT_ZONES = _LEGACY_SEAT_ZONES
+    BUTTONS_REGION = _LEGACY_BUTTONS_REGION
+    CAPTURE_TABLE_FORMAT = "six_max"
+    CAPTURE_ACTIVE_SEAT_INDICES = frozenset(range(6))
+    CAPTURE_LAYOUT_FINGERPRINT = hashlib.sha256(
+        json.dumps(
+            {
+                "layout_id": "embedded_legacy_six_max_v1",
+                "regions": {
+                    **_LEGACY_SEAT_ZONES,
+                    "buttons": _LEGACY_BUTTONS_REGION,
+                },
+            },
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+else:
+    profile_regions = CAPTURE_LAYOUT_PROFILE.region_map
+    BUTTONS_REGION = profile_regions.pop("buttons")
+    SEAT_ZONES = profile_regions
+    CAPTURE_TABLE_FORMAT = CAPTURE_LAYOUT_PROFILE.table_format
+    CAPTURE_ACTIVE_SEAT_INDICES = CAPTURE_LAYOUT_PROFILE.active_seat_indices
+    CAPTURE_LAYOUT_FINGERPRINT = CAPTURE_LAYOUT_PROFILE.fingerprint
 
 DEBUG_DIR = os.path.join(os.path.dirname(__file__), "debug_images")
 
 # Each opponent capture maps directly to the zero-based seat index used by the
 # vision response. Hero is intentionally excluded: their face-up cards are read
 # separately by Gemini.
-OPPONENT_CAPTURE_SEATS = {
-    "seat1": 0,
-    "seat2": 1,
-    "seat3": 2,
-    "seat4": 3,
-    "seat6": 5,
-}
+OPPONENT_CAPTURE_SEATS = (
+    {
+        "seat1": 0,
+        "seat2": 1,
+        "seat3": 2,
+        "seat4": 3,
+        "seat6": 5,
+    }
+    if CAPTURE_LAYOUT_PROFILE is None
+    else CAPTURE_LAYOUT_PROFILE.opponent_capture_seats
+)
 
 def clear_debug_images():
     """Clear all files in the debug_images directory."""
@@ -877,6 +937,99 @@ def compress_image(img: Image.Image, max_size: int = 400) -> Image.Image:
     return img
 
 
+def capture_or_explicit_blank(captures: dict, capture_name: str) -> Image.Image:
+    """Return one crop or a labelled blank for an inactive canonical seat.
+
+    Missing active regions remain errors. Only the four absent slots in a
+    reviewed native-HU layout may be materialized as blanks.
+    """
+    image = captures.get(capture_name)
+    if image is not None:
+        return image
+    seat_index = CANONICAL_SEAT_CAPTURES.get(capture_name)
+    if (
+        CAPTURE_TABLE_FORMAT != "heads_up"
+        or seat_index is None
+        or seat_index in CAPTURE_ACTIVE_SEAT_INDICES
+    ):
+        raise KeyError(f"missing calibrated capture {capture_name!r}")
+
+    blank = Image.new("RGB", (320, 150), (8, 10, 12))
+    draw = ImageDraw.Draw(blank)
+    try:
+        font = ImageFont.load_default(size=16)
+    except TypeError:
+        font = ImageFont.load_default()
+    draw.text(
+        (12, 62),
+        f"S{seat_index} UNUSED IN NATIVE HU",
+        fill=(120, 130, 140),
+        font=font,
+    )
+    return blank
+
+
+def vision_capture_layout_instruction() -> str:
+    if CAPTURE_TABLE_FORMAT != "heads_up":
+        return ""
+    inactive = sorted(set(range(6)) - set(CAPTURE_ACTIVE_SEAT_INDICES))
+    inactive_text = ",".join(f"S{index}" for index in inactive)
+    return (
+        "\nCALIBRATED NATIVE HEADS-UP LAYOUT: only S0 (opponent) and S4 "
+        "(Hero) are real player pods. "
+        f"{inactive_text} are labelled blank placeholders, not empty physical "
+        "pods. For every placeholder emit username/action='', stack/bet=0, "
+        "and status E. Dealer index d must be 0 or 4."
+    )
+
+
+def enforce_native_hu_wire_slots(data: dict) -> dict:
+    """Reject any semantic content invented in inactive HU protocol slots."""
+    if CAPTURE_TABLE_FORMAT != "heads_up" or not isinstance(data, dict):
+        return data
+    if "s" not in data:
+        raise ValueError(
+            "native-HU capture requires the compact six-slot vision schema"
+        )
+    field_defaults = {
+        "n": "",
+        "s": 0,
+        "w": 0,
+        "x": "E",
+        "v": "",
+    }
+    inactive = sorted(set(range(6)) - set(CAPTURE_ACTIVE_SEAT_INDICES))
+    for field, default in field_defaults.items():
+        values = data.get(field)
+        if not isinstance(values, list) or len(values) != 6:
+            raise ValueError(f"native-HU field {field!r} must contain six slots")
+        for seat_index in inactive:
+            value = values[seat_index]
+            if isinstance(default, int):
+                valid = (
+                    not isinstance(value, bool)
+                    and isinstance(value, (int, float))
+                    and float(value) == 0.0
+                )
+            else:
+                valid = value == default
+            if not valid:
+                raise ValueError(
+                    f"vision populated inactive native-HU slot S{seat_index} "
+                    f"in field {field!r}"
+                )
+    dealer = data.get("d")
+    if (
+        isinstance(dealer, bool)
+        or not isinstance(dealer, int)
+        or dealer not in CAPTURE_ACTIVE_SEAT_INDICES
+    ):
+        raise ValueError(
+            f"native-HU dealer must be in {sorted(CAPTURE_ACTIVE_SEAT_INDICES)}"
+        )
+    return data
+
+
 def build_vision_mosaic(captures: dict) -> Image.Image:
     """Combine all semantic crops into one native-resolution labelled image.
 
@@ -905,7 +1058,7 @@ def build_vision_mosaic(captures: dict) -> Image.Image:
     for label, capture_name, (left, top, right, bottom) in cells:
         draw.rectangle((left, top, right, bottom), outline=(82, 91, 101), width=2)
         draw.text((left + 7, top + 4), label, fill=(100, 220, 235), font=font)
-        image = captures[capture_name].convert("RGB")
+        image = capture_or_explicit_blank(captures, capture_name).convert("RGB")
         available_width = right - left - 12
         available_height = bottom - top - 28
         scale = min(1.0, available_width / image.width, available_height / image.height)
@@ -1126,6 +1279,12 @@ def grab_zone_set(monitor: int, zones: dict) -> dict:
     """Grab one atomic bounding frame and crop named regions in memory."""
     with mss.MSS() as sct:
         selected_monitor = sct.monitors[monitor]
+        if CAPTURE_LAYOUT_PROFILE is not None:
+            CAPTURE_LAYOUT_PROFILE.assert_monitor(
+                monitor,
+                int(selected_monitor["width"]),
+                int(selected_monitor["height"]),
+            )
         mon_left = selected_monitor["left"]
         mon_top = selected_monitor["top"]
         normalized = {
@@ -1363,6 +1522,7 @@ def capture_regions():
 
 def expand_fast_vision_payload(data: dict) -> dict:
     """Expand the compact Gemini wire schema into the legacy parser shape."""
+    data = enforce_native_hu_wire_slots(data)
     if not isinstance(data, dict) or "s" not in data:
         return data
 
@@ -1441,6 +1601,10 @@ def parse_response(
 ) -> GameSnapshot:
     """Parses Vision Response into a GameSnapshot."""
     snapshot = GameSnapshot()
+    snapshot.capture_table_format = CAPTURE_TABLE_FORMAT
+    snapshot.capture_layout_fingerprint = CAPTURE_LAYOUT_FINGERPRINT
+    if CAPTURE_TABLE_FORMAT == "heads_up":
+        snapshot.meta_info.table_size = 2
     local_card_evidence_available = locally_dealt_seats is not None
     locally_dealt_seats = locally_dealt_seats or set()
     snapshot.timestamp = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
@@ -1831,19 +1995,20 @@ def build_vision_request(captures: dict) -> tuple[list, types.GenerateContentCon
     """Build either the compact one-image request or the legacy request."""
     if VISION_LAYOUT == "legacy":
         seat_images = [
-            compress_image(captures["seat1"]),
-            compress_image(captures["seat2"]),
-            compress_image(captures["seat3"]),
-            compress_image(captures["seat4"]),
-            compress_image(captures["hero"]),
-            compress_image(captures["seat6"]),
+            compress_image(capture_or_explicit_blank(captures, "seat1")),
+            compress_image(capture_or_explicit_blank(captures, "seat2")),
+            compress_image(capture_or_explicit_blank(captures, "seat3")),
+            compress_image(capture_or_explicit_blank(captures, "seat4")),
+            compress_image(capture_or_explicit_blank(captures, "hero")),
+            compress_image(capture_or_explicit_blank(captures, "seat6")),
         ]
         images = seat_images + [
             compress_image(captures["board"]),
             compress_image(captures["buttons"]),
         ]
         return (
-            [ANALYZE_PROMPT] + [image_to_gemini_part(image) for image in images],
+            [ANALYZE_PROMPT + vision_capture_layout_instruction()]
+            + [image_to_gemini_part(image) for image in images],
             types.GenerateContentConfig(
                 max_output_tokens=1200,
                 thinking_config=types.ThinkingConfig(
@@ -1857,7 +2022,7 @@ def build_vision_request(captures: dict) -> tuple[list, types.GenerateContentCon
     card_detail = build_vision_card_detail(captures)
     return (
         [
-            FAST_ANALYZE_PROMPT,
+            FAST_ANALYZE_PROMPT + vision_capture_layout_instruction(),
             image_to_gemini_part(mosaic),
             image_to_gemini_part(core_detail),
             image_to_gemini_png_part(card_detail),
@@ -4225,7 +4390,7 @@ def sanitize_strategy_response(analysis: str, strategy_context: StrategyContext)
 
 def build_parallel_strategy_prompt(history_hint: str = "") -> str:
     """Prompt Haiku to make a decision directly from the same captured frame."""
-    return """Read the labelled PokerStars mosaic and choose one practical micro-stakes NLHE action.
+    prompt = """Read the labelled PokerStars mosaic and choose one practical micro-stakes NLHE action.
 Seats S0 through S5 are clockwise table order; Hero is S4. Use the visible D marker to determine position.
 Read suit glyph shapes, not color alone: red may be hearts or diamonds; black may be spades or clubs.
 Use only the large current ACTIONS buttons. Ignore Check/Fold, Call Any, and other small pre-action checkboxes.
@@ -4246,6 +4411,13 @@ Return exactly these twelve fields, one per line:
 **Action:** [Fold/Check/Call/Bet/Raise]
 **Size:** [specific BB amount, or 0 for Check/Fold]
 **Why:** [one short sentence]"""
+    if CAPTURE_TABLE_FORMAT == "heads_up":
+        prompt += (
+            "\nThis is a calibrated native heads-up layout: only S0 and S4 are "
+            "real seats. S1, S2, S3, and S5 are labelled protocol blanks and "
+            "must not be treated as players."
+        )
+    return prompt
 
 
 def request_parallel_strategy(
@@ -5450,6 +5622,7 @@ def build_multiway_solver_state(
         "snapshot_timestamp": snapshot.timestamp,
         "hero_seat": hero.seat_index,
         "hero_combo": list(hero.hole_cards or ()),
+        "capture_layout_fingerprint": CAPTURE_LAYOUT_FINGERPRINT,
     }
     capture_id = hashlib.sha256(
         json.dumps(

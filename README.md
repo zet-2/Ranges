@@ -8,7 +8,8 @@ approximate; Claude and hybrid fallback remain explicit opt-ins.
 
 ## How it works
 
-1. Captures six seat regions, the board, and the action buttons.
+1. Captures calibrated player, board, and action-button regions. The embedded
+   layout has six seats; a reviewed native-HU profile captures only S0 and S4.
 2. Combines the crops into a labelled table mosaic plus a focused
    Hero/board/buttons detail image, replacing the original eight image parts.
 3. Parses Gemini's compact structured JSON into a game snapshot.
@@ -66,11 +67,15 @@ Add your API keys to `.env`, then calibrate the screen regions if necessary:
   heart/diamond and spade/club glyphs are not damaged by JPEG compression.
 - `VISION_LAYOUT` defaults to the faster `mosaic`; set it to `legacy` to send
   the original eight separate images for comparison.
-- `SAVE_DEBUG_IMAGES` defaults to `0`, avoiding eight synchronous PNG writes
+- `SAVE_DEBUG_IMAGES` defaults to `0`, avoiding up to eight synchronous PNG writes
   on every decision. With this setting, the images in `debug_images/` are not
   expected to be the latest normal capture. Set it to `1` while diagnosing.
   Rejected stale analyses are always stored in timestamped folders under
   `debug_images/stale/`; `latest.txt` points to the newest one.
+- `POKER_CAPTURE_LAYOUT_PATH` optionally selects a reviewed, fingerprinted
+  native-HU layout. Draft profiles, monitor-resolution drift, unexpected
+  regions, and semantic content in inactive seat slots fail closed. Leaving it
+  unset preserves the embedded six-seat layout exactly.
 - `STRATEGY_BACKEND` defaults to strict `GTO`. `CLAUDE` opts into model-only
   strategy; `HYBRID` opts into a clearly labelled Claude fallback.
 - `ANTHROPIC_API_KEY` is required only for `CLAUDE` or `HYBRID`.
@@ -94,8 +99,23 @@ Add your API keys to `.env`, then calibrate the screen regions if necessary:
   latest atomic snapshot/transcript pair is no longer current.
 - `CLAUDE_MODEL` is used by COACH mode and defaults to `claude-sonnet-5`.
 
+For a native HU layout, create a draft from an actual owned-simulator table,
+inspect its hashed crop preview, then approve that exact evidence. No guessed HU
+coordinates are included:
+
 ```bash
-python calibrate.py
+.venv/bin/python calibrate.py heads-up \
+  --layout-id pokerstars.hu.owned-sim.v1 \
+  --monitor 1 \
+  --output debug_images/calibration/hu-v1/draft.json \
+  --evidence-dir debug_images/calibration/hu-v1/evidence
+```
+
+See [the native HU calibration contract](docs/hu_capture_calibration.md) for
+the review/approval command and the required acceptance corpus. Start the app
+with:
+
+```bash
 python poker_assistant.py
 ```
 
@@ -360,6 +380,24 @@ remain available with `GTO_RANGE_SOURCE=charts`.
 The exact fail-closed contract, measured limits, solve-server hardware tiers,
 and remaining architecture are tracked in
 [docs/full_gto_readiness.md](docs/full_gto_readiness.md).
+
+### Raked HU jam/fold reference
+
+`hu_jam_fold.py` provides a solver-neutral integration harness for a finite HU
+game where BTN/SB may fold or jam and BB may fold or call. The game artifact
+pins the joint private-type model, terminal equities, stack, blinds, rake,
+no-flop-no-drop rule, cap, chip rounding, and a SHA-256 identity. A solution is
+accepted only after recomputing the full best response of both players and
+checking both unilateral deviation gaps against the declared epsilon.
+
+The included two-type fixture is an integration reference, not a Hold'em range
+or live strategy. Every manifest declares `full_hunl=false`; unmet targets and
+tampered strategies fail closed. Commands, exact semantics, and the admission
+gates for any future poker-derived artifact are documented in
+[docs/hu_jam_fold_reference.md](docs/hu_jam_fold_reference.md).
+The broader native-HU scope, Monker gates, and the distinction between a
+solver-derived blueprint and a measured epsilon certificate are tracked in
+[docs/hu_delivery_plan.md](docs/hu_delivery_plan.md).
 
 ### Remote solve server
 
